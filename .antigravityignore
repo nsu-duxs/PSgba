@@ -1,0 +1,23 @@
+# Submódulo do mGBA: ignore tudo por padrão, exceto os headers principais e o core
+mgba/src/platform/
+mgba/src/util/gui/
+mgba/tools/
+mgba/test/
+mgba/qt/
+mgba/.git/
+
+# Binários e arquivos temporários de build
+build/
+bin/
+*.elf
+*.prx
+*.o
+*.a
+*.pkg
+*.bin
+*.gba
+*.sav
+
+# Git internals
+.git/
+.gitmodules
