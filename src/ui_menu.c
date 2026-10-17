@@ -10,8 +10,12 @@
 #include <dirent.h>
 #include <orbis/Pad.h>
 
+#define LAUNCHER_ROM_START_IDX 4
+
 enum {
     OSD_ITEM_RESUME = 0,
+    OSD_ITEM_VIDEO_RES,
+    OSD_ITEM_SHOW_FPS,
     OSD_ITEM_AUDIO_FOCUS,
     OSD_ITEM_QUICK_SAVE,
     OSD_ITEM_QUICK_LOAD,
@@ -25,12 +29,13 @@ enum {
 static UIAppState s_app_state = UI_STATE_LAUNCHER;
 static int s_num_players = 4;
 static UIRomMode s_rom_mode = UI_ROM_MODE_SHARED;
+static bool s_show_fps = true;
 
 static char s_rom_files[UI_MAX_ROMS][UI_MAX_FILENAME];
 static char s_rom_paths[UI_MAX_ROMS][UI_MAX_PATH];
 static int s_rom_count = 0;
 
-static int s_launcher_cursor = 0; /* 0 = Players, 1 = ROM Mode, 2+ = ROM list */
+static int s_launcher_cursor = 0; /* 0 = Players, 1 = ROM Mode, 2 = Resolution, 3 = FPS, 4+ = ROM list */
 static int s_selecting_player = 0;
 static char s_selected_roms[GBA_MAX_INSTANCES][UI_MAX_PATH];
 static char s_launcher_status[128] = "";
@@ -142,7 +147,7 @@ void ui_menu_init(void) {
     s_app_state = UI_STATE_LAUNCHER;
     s_num_players = 4;
     s_rom_mode = UI_ROM_MODE_SHARED;
-    s_launcher_cursor = 2;
+    s_launcher_cursor = LAUNCHER_ROM_START_IDX;
     s_selecting_player = 0;
     s_osd_cursor = 0;
     s_osd_player = 0;
@@ -168,17 +173,25 @@ bool ui_menu_is_osd_open(void) {
     return (s_app_state == UI_STATE_OSD);
 }
 
+bool ui_menu_is_fps_visible(void) {
+    return s_show_fps;
+}
+
+void ui_menu_set_fps_visible(bool visible) {
+    s_show_fps = visible;
+}
+
 void ui_menu_update_launcher(struct PS4GBA_Context* ctx, uint32_t buttons_pressed) {
     (void)ctx;
     if (buttons_pressed & ORBIS_PAD_BUTTON_TRIANGLE) {
         ui_menu_scan_roms();
-        s_launcher_cursor = 2;
+        s_launcher_cursor = LAUNCHER_ROM_START_IDX;
         snprintf(s_launcher_status, sizeof(s_launcher_status),
                  "Lista de ROMs atualizada (/data/gba4p/roms e /mnt/usb0)");
         return;
     }
 
-    int total_items = 2 + s_rom_count;
+    int total_items = LAUNCHER_ROM_START_IDX + s_rom_count;
 
     if (buttons_pressed & ORBIS_PAD_BUTTON_UP) {
         s_launcher_cursor = (s_launcher_cursor - 1 + total_items) % total_items;
@@ -203,14 +216,25 @@ void ui_menu_update_launcher(struct PS4GBA_Context* ctx, uint32_t buttons_presse
                              : UI_ROM_MODE_SHARED;
             s_selecting_player = 0;
         }
-    } else if (s_launcher_cursor >= 2) {
+    } else if (s_launcher_cursor == 2) {
+        if (buttons_pressed & ORBIS_PAD_BUTTON_LEFT) {
+            video_cycle_res_mode(-1);
+        }
+        if (buttons_pressed & (ORBIS_PAD_BUTTON_RIGHT | ORBIS_PAD_BUTTON_CROSS)) {
+            video_cycle_res_mode(1);
+        }
+    } else if (s_launcher_cursor == 3) {
+        if (buttons_pressed & (ORBIS_PAD_BUTTON_LEFT | ORBIS_PAD_BUTTON_RIGHT | ORBIS_PAD_BUTTON_CROSS)) {
+            s_show_fps = !s_show_fps;
+        }
+    } else if (s_launcher_cursor >= LAUNCHER_ROM_START_IDX) {
         if ((buttons_pressed & ORBIS_PAD_BUTTON_CIRCLE) &&
             s_rom_mode == UI_ROM_MODE_INDIVIDUAL && s_selecting_player > 0) {
             s_selecting_player--;
         }
 
         if (buttons_pressed & ORBIS_PAD_BUTTON_CROSS) {
-            int rom_idx = s_launcher_cursor - 2;
+            int rom_idx = s_launcher_cursor - LAUNCHER_ROM_START_IDX;
             if (rom_idx >= 0 && rom_idx < s_rom_count) {
                 if (s_rom_mode == UI_ROM_MODE_SHARED) {
                     const char* path = s_rom_paths[rom_idx];
@@ -262,6 +286,19 @@ void ui_menu_update_osd(struct PS4GBA_Context* ctx, uint32_t buttons_pressed) {
     }
     if (buttons_pressed & ORBIS_PAD_BUTTON_DOWN) {
         s_osd_cursor = (s_osd_cursor + 1) % OSD_ITEM_COUNT;
+    }
+
+    if (s_osd_cursor == OSD_ITEM_VIDEO_RES &&
+        (buttons_pressed & (ORBIS_PAD_BUTTON_LEFT | ORBIS_PAD_BUTTON_RIGHT | ORBIS_PAD_BUTTON_CROSS))) {
+        int delta = (buttons_pressed & ORBIS_PAD_BUTTON_LEFT) ? -1 : 1;
+        video_cycle_res_mode(delta);
+        return;
+    }
+
+    if (s_osd_cursor == OSD_ITEM_SHOW_FPS &&
+        (buttons_pressed & (ORBIS_PAD_BUTTON_LEFT | ORBIS_PAD_BUTTON_RIGHT | ORBIS_PAD_BUTTON_CROSS))) {
+        s_show_fps = !s_show_fps;
+        return;
     }
 
     if (s_osd_cursor == OSD_ITEM_AUDIO_FOCUS &&
@@ -340,20 +377,20 @@ void ui_menu_render_launcher(uint32_t* fb) {
     draw_rect_solid(fb, 0, 0, PS4_SCREEN_WIDTH, PS4_SCREEN_HEIGHT, 0xFF10141EU);
     draw_rect_border(fb, 60, 40, PS4_SCREEN_WIDTH - 120, PS4_SCREEN_HEIGHT - 80, 3, 0xFF3A86FFU);
 
-    ui_draw_text(fb, 120, 80, "PS4 GBA 4-WAY SPLIT-SCREEN EMULATOR", 0xFFFFFFFFU, 3);
+    ui_draw_text(fb, 120, 76, "PS4 GBA 4-WAY SPLIT-SCREEN EMULATOR v1.01", 0xFFFFFFFFU, 3);
 
     static const char* const layout_labels[5] = {
         "",
-        "1P (Tela Cheia 1440x960 - 6x)",
-        "2P (Split Side-by-Side 960x640 - 4x)",
-        "3P (Quadrantes 2x2 720x480 - 3x)",
-        "4P (Quadrantes 2x2 720x480 - 3x)"
+        "1P (Tela Unica HD 1620x1080 / 1920x1080)",
+        "2P (Split Side-by-Side HD 960x640 / 960x720)",
+        "3P (Quadrantes 2x2 HD 804x532 / 960x540)",
+        "4P (Quadrantes 2x2 HD 804x532 / 960x540)"
     };
 
     char line_buf[256];
     snprintf(line_buf, sizeof(line_buf), "%s Jogadores Ativos: < %s >",
              (s_launcher_cursor == 0) ? ">" : " ", layout_labels[s_num_players]);
-    ui_draw_text(fb, 120, 160, line_buf,
+    ui_draw_text(fb, 120, 142, line_buf,
                  (s_launcher_cursor == 0) ? 0xFF00F5D4U : 0xFFCCCCCCU, 2);
 
     snprintf(line_buf, sizeof(line_buf), "%s Modo de ROM: < %s >",
@@ -361,29 +398,43 @@ void ui_menu_render_launcher(uint32_t* fb) {
              (s_rom_mode == UI_ROM_MODE_SHARED)
                  ? "Mesma ROM para todos"
                  : "ROM individual por jogador");
-    ui_draw_text(fb, 120, 200, line_buf,
+    ui_draw_text(fb, 120, 178, line_buf,
                  (s_launcher_cursor == 1) ? 0xFF00F5D4U : 0xFFCCCCCCU, 2);
+
+    snprintf(line_buf, sizeof(line_buf), "%s Resolucao / Qualidade: < %s >",
+             (s_launcher_cursor == 2) ? ">" : " ",
+             video_get_res_mode_name(video_get_res_mode()));
+    ui_draw_text(fb, 120, 214, line_buf,
+                 (s_launcher_cursor == 2) ? 0xFF00F5D4U : 0xFFCCCCCCU, 2);
+
+    snprintf(line_buf, sizeof(line_buf), "%s Mostrar Contador de FPS: < %s >",
+             (s_launcher_cursor == 3) ? ">" : " ",
+             s_show_fps ? "Ligado (Canto Superior)" : "Desligado");
+    ui_draw_text(fb, 120, 250, line_buf,
+                 (s_launcher_cursor == 3) ? 0xFF00F5D4U : 0xFFCCCCCCU, 2);
 
     if (s_rom_mode == UI_ROM_MODE_INDIVIDUAL) {
         snprintf(line_buf, sizeof(line_buf),
-                 "Selecione a ROM para o JOGADOR %d de %d (/data/gba4p/roms/):",
+                 "Selecione a ROM para o JOGADOR %d de %d (/data/gba4p/roms/ ou USB):",
                  s_selecting_player + 1, s_num_players);
     } else {
         snprintf(line_buf, sizeof(line_buf),
-                 "ROMS disponiveis em /data/gba4p/roms/ (%d encontradas):", s_rom_count);
+                 "ROMS disponiveis (%d encontradas - [TRIANGULO] Atualizar):", s_rom_count);
     }
-    ui_draw_text(fb, 120, 260, line_buf, 0xFFFFBE0BU, 2);
+    ui_draw_text(fb, 120, 300, line_buf, 0xFFFFBE0BU, 2);
 
     int max_visible = 15;
-    int selected_rom = (s_launcher_cursor >= 2) ? (s_launcher_cursor - 2) : 0;
+    int selected_rom = (s_launcher_cursor >= LAUNCHER_ROM_START_IDX)
+                           ? (s_launcher_cursor - LAUNCHER_ROM_START_IDX)
+                           : 0;
     int start_idx = (selected_rom >= max_visible) ? (selected_rom - max_visible + 1) : 0;
 
     for (int i = 0; i < max_visible && (start_idx + i) < s_rom_count; ++i) {
         int idx = start_idx + i;
-        bool is_sel = (s_launcher_cursor == idx + 2);
+        bool is_sel = (s_launcher_cursor == idx + LAUNCHER_ROM_START_IDX);
         snprintf(line_buf, sizeof(line_buf), "%s [%02d] %s",
                  is_sel ? "->" : "  ", idx + 1, s_rom_files[idx]);
-        ui_draw_text(fb, 140, 310 + i * 36, line_buf,
+        ui_draw_text(fb, 140, 344 + i * 36, line_buf,
                      is_sel ? 0xFFFFFFFFU : 0xFF99A3B8U, 2);
     }
 
@@ -401,18 +452,26 @@ void ui_menu_render_osd(uint32_t* fb, struct PS4GBA_Context* ctx) {
         return;
     }
 
-    int box_x = 460;
-    int box_y = 200;
-    int box_w = 1000;
-    int box_h = 680;
+    int box_x = 380;
+    int box_y = 140;
+    int box_w = 1160;
+    int box_h = 800;
 
     draw_rect_translucent(fb, box_x, box_y, box_w, box_h, 0x000A101AU);
     draw_rect_border(fb, box_x, box_y, box_w, box_h, 3, 0xFF00F5D4U);
 
     char buf[160];
-    snprintf(buf, sizeof(buf), "MENU OSD - CONTROLE P%d (%s)",
+    snprintf(buf, sizeof(buf), "MENU OSD v1.01 - CONTROLE P%d (%s)",
              s_osd_player + 1, ctx ? ctx->rom_name : "");
-    ui_draw_text(fb, box_x + 50, box_y + 40, buf, 0xFFFFBE0BU, 3);
+    ui_draw_text(fb, box_x + 50, box_y + 36, buf, 0xFFFFBE0BU, 3);
+
+    char item_res[140];
+    snprintf(item_res, sizeof(item_res), "Resolucao / Qualidade: < %s >",
+             video_get_res_mode_name(video_get_res_mode()));
+
+    char item_fps[96];
+    snprintf(item_fps, sizeof(item_fps), "Contador de FPS na Tela: < %s >",
+             s_show_fps ? "Ligado" : "Desligado");
 
     char focus_label[64];
     if (audio_get_mode() == PS4_AUDIO_MODE_MIX) {
@@ -433,6 +492,8 @@ void ui_menu_render_osd(uint32_t* fb, struct PS4GBA_Context* ctx) {
 
     const char* items[OSD_ITEM_COUNT] = {
         "Continuar Jogo",
+        item_res,
+        item_fps,
         item_audio,
         item_qsave,
         item_qload,
@@ -445,15 +506,40 @@ void ui_menu_render_osd(uint32_t* fb, struct PS4GBA_Context* ctx) {
     for (int i = 0; i < OSD_ITEM_COUNT; ++i) {
         bool sel = (s_osd_cursor == i);
         snprintf(buf, sizeof(buf), "%s %s", sel ? "->" : "  ", items[i]);
-        ui_draw_text(fb, box_x + 60, box_y + 120 + i * 54, buf,
+        ui_draw_text(fb, box_x + 50, box_y + 104 + i * 50, buf,
                      sel ? 0xFF00F5D4U : 0xFFE0E0E0U, 2);
     }
 
     if (s_osd_status[0]) {
-        ui_draw_text(fb, box_x + 60, box_y + 575, s_osd_status, 0xFF38B000U, 2);
+        ui_draw_text(fb, box_x + 50, box_y + 660, s_osd_status, 0xFF38B000U, 2);
     }
 
-    ui_draw_text(fb, box_x + 60, box_y + 625,
-                 "[X] Selecionar   [CIRCLE/OPTIONS] Fechar OSD", 0xFF8899AAU, 2);
+    ui_draw_text(fb, box_x + 50, box_y + 720,
+                 "[X / SETAS] Selecionar/Alterar   [CIRCLE/OPTIONS] Fechar OSD", 0xFF8899AAU, 2);
+}
+
+void ui_menu_render_fps_overlay(uint32_t* fb, int fps) {
+    if (!fb || !s_show_fps) {
+        return;
+    }
+
+    int badge_x = 24;
+    int badge_y = 14;
+    int badge_w = 156;
+    int badge_h = 34;
+
+    uint32_t color = 0xFF38B000U; /* Green (>= 55 FPS) */
+    if (fps < 35) {
+        color = 0xFFFF595EU;      /* Red   (< 35 FPS)  */
+    } else if (fps < 55) {
+        color = 0xFFFFBE0BU;      /* Gold  (35..54 FPS)*/
+    }
+
+    draw_rect_solid(fb, badge_x, badge_y, badge_w, badge_h, 0xFF10141EU);
+    draw_rect_border(fb, badge_x, badge_y, badge_w, badge_h, 2, color);
+
+    char fps_text[32];
+    snprintf(fps_text, sizeof(fps_text), "FPS: %2d", fps);
+    ui_draw_text(fb, badge_x + 18, badge_y + 9, fps_text, color, 2);
 }
 

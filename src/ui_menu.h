@@ -27,12 +27,15 @@ UIAppState ui_menu_get_state(void);
 void ui_menu_set_state(UIAppState state);
 void ui_menu_open_osd(int trigger_player);
 bool ui_menu_is_osd_open(void);
+bool ui_menu_is_fps_visible(void);
+void ui_menu_set_fps_visible(bool visible);
 
 void ui_menu_update_launcher(struct PS4GBA_Context* ctx, uint32_t buttons_pressed);
 void ui_menu_update_osd(struct PS4GBA_Context* ctx, uint32_t buttons_pressed);
 
 void ui_menu_render_launcher(uint32_t* fb);
 void ui_menu_render_osd(uint32_t* fb, struct PS4GBA_Context* ctx);
+void ui_menu_render_fps_overlay(uint32_t* fb, int fps);
 
 #endif /* UI_MENU_H */
 
