@@ -27,6 +27,7 @@ static int s_num_players = 4;
 static UIRomMode s_rom_mode = UI_ROM_MODE_SHARED;
 
 static char s_rom_files[UI_MAX_ROMS][UI_MAX_FILENAME];
+static char s_rom_paths[UI_MAX_ROMS][UI_MAX_PATH];
 static int s_rom_count = 0;
 
 static int s_launcher_cursor = 0; /* 0 = Players, 1 = ROM Mode, 2+ = ROM list */
@@ -85,28 +86,52 @@ static bool has_gba_extension(const char* name) {
     return (strcasecmp(dot, ".gba") == 0);
 }
 
+static void scan_rom_directory(const char* dir_path) {
+    DIR* dir = opendir(dir_path);
+    if (!dir) {
+        return;
+    }
+
+    struct dirent* entry;
+    while ((entry = readdir(dir)) != NULL && s_rom_count < UI_MAX_ROMS) {
+        if (entry->d_name[0] == '.') {
+            continue;
+        }
+        if (has_gba_extension(entry->d_name)) {
+            snprintf(s_rom_paths[s_rom_count], UI_MAX_PATH, "%s/%s", dir_path, entry->d_name);
+            strncpy(s_rom_files[s_rom_count], entry->d_name, UI_MAX_FILENAME - 1);
+            s_rom_files[s_rom_count][UI_MAX_FILENAME - 1] = '\0';
+            s_rom_count++;
+        }
+    }
+    closedir(dir);
+}
+
 void ui_menu_scan_roms(void) {
     s_rom_count = 0;
     memset(s_rom_files, 0, sizeof(s_rom_files));
+    memset(s_rom_paths, 0, sizeof(s_rom_paths));
 
-    DIR* dir = opendir(PS4_ROMS_DIR);
-    if (dir) {
-        struct dirent* entry;
-        while ((entry = readdir(dir)) != NULL && s_rom_count < UI_MAX_ROMS) {
-            if (entry->d_name[0] == '.') {
-                continue;
-            }
-            if (has_gba_extension(entry->d_name)) {
-                strncpy(s_rom_files[s_rom_count], entry->d_name, UI_MAX_FILENAME - 1);
-                s_rom_files[s_rom_count][UI_MAX_FILENAME - 1] = '\0';
-                s_rom_count++;
-            }
+    static const char* const k_search_dirs[] = {
+        PS4_ROMS_DIR,
+        "/data/roms",
+        "/mnt/usb0/gba4p/roms",
+        "/mnt/usb0/roms",
+        "/mnt/usb0",
+        "/mnt/usb1/gba4p/roms",
+        "/mnt/usb1/roms",
+        "/mnt/usb1"
+    };
+
+    for (size_t i = 0; i < sizeof(k_search_dirs) / sizeof(k_search_dirs[0]); ++i) {
+        if (s_rom_count < UI_MAX_ROMS) {
+            scan_rom_directory(k_search_dirs[i]);
         }
-        closedir(dir);
     }
 
     if (s_rom_count == 0) {
-        strncpy(s_rom_files[0], "test.gba", UI_MAX_FILENAME - 1);
+        strncpy(s_rom_files[0], "test.gba (Demo 4P Link Integrada)", UI_MAX_FILENAME - 1);
+        snprintf(s_rom_paths[0], UI_MAX_PATH, "%s/test.gba", PS4_ROMS_DIR);
         s_rom_count = 1;
     }
 }
@@ -143,17 +168,16 @@ bool ui_menu_is_osd_open(void) {
     return (s_app_state == UI_STATE_OSD);
 }
 
-static void build_rom_full_path(const char* filename, char* out_path, size_t max_len) {
-    if (strcmp(filename, "test.gba") == 0) {
-        /* Try /data/gba4p/roms/test.gba first, fallback to /data/roms/test.gba */
-        snprintf(out_path, max_len, "%s/%s", PS4_ROMS_DIR, filename);
-    } else {
-        snprintf(out_path, max_len, "%s/%s", PS4_ROMS_DIR, filename);
-    }
-}
-
 void ui_menu_update_launcher(struct PS4GBA_Context* ctx, uint32_t buttons_pressed) {
     (void)ctx;
+    if (buttons_pressed & ORBIS_PAD_BUTTON_TRIANGLE) {
+        ui_menu_scan_roms();
+        s_launcher_cursor = 2;
+        snprintf(s_launcher_status, sizeof(s_launcher_status),
+                 "Lista de ROMs atualizada (/data/gba4p/roms e /mnt/usb0)");
+        return;
+    }
+
     int total_items = 2 + s_rom_count;
 
     if (buttons_pressed & ORBIS_PAD_BUTTON_UP) {
@@ -189,29 +213,22 @@ void ui_menu_update_launcher(struct PS4GBA_Context* ctx, uint32_t buttons_presse
             int rom_idx = s_launcher_cursor - 2;
             if (rom_idx >= 0 && rom_idx < s_rom_count) {
                 if (s_rom_mode == UI_ROM_MODE_SHARED) {
-                    char path[UI_MAX_PATH];
-                    build_rom_full_path(s_rom_files[rom_idx], path, sizeof(path));
+                    const char* path = s_rom_paths[rom_idx];
                     const char* paths[GBA_MAX_INSTANCES] = { path, path, path, path };
                     bool ok = emulator_init_session(paths, s_num_players);
-                    if (!ok) {
-                        const char* fallback[GBA_MAX_INSTANCES] = {
-                            "/data/roms/test.gba", "/data/roms/test.gba",
-                            "/data/roms/test.gba", "/data/roms/test.gba"
-                        };
-                        ok = emulator_init_session(fallback, s_num_players);
-                    }
                     if (ok) {
                         s_launcher_status[0] = '\0';
                         s_app_state = UI_STATE_INGAME;
                     } else {
                         ui_menu_scan_roms();
                         snprintf(s_launcher_status, sizeof(s_launcher_status),
-                                 "Coloque arquivos .gba em /data/gba4p/roms/ via FTP/USB e aperte [X]");
+                                 "Coloque arquivos .gba em /data/gba4p/roms/ ou /mnt/usb0/roms/");
                     }
                 } else {
-                    build_rom_full_path(s_rom_files[rom_idx],
-                                        s_selected_roms[s_selecting_player],
-                                        sizeof(s_selected_roms[s_selecting_player]));
+                    strncpy(s_selected_roms[s_selecting_player],
+                            s_rom_paths[rom_idx],
+                            sizeof(s_selected_roms[s_selecting_player]) - 1);
+                    s_selected_roms[s_selecting_player][sizeof(s_selected_roms[s_selecting_player]) - 1] = '\0';
                     s_selecting_player++;
                     if (s_selecting_player >= s_num_players) {
                         const char* paths[GBA_MAX_INSTANCES] = {
@@ -225,7 +242,7 @@ void ui_menu_update_launcher(struct PS4GBA_Context* ctx, uint32_t buttons_presse
                         } else {
                             ui_menu_scan_roms();
                             snprintf(s_launcher_status, sizeof(s_launcher_status),
-                                     "Erro ao abrir ROM. Verifique /data/gba4p/roms/");
+                                     "Erro ao abrir ROM. Verifique /data/gba4p/roms/ ou USB");
                         }
                     }
                 }

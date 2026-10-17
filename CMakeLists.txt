@@ -32,15 +32,22 @@ set(CMAKE_CXX_COMPILER "clang++")
 
 project(ps4_gba_4p C CXX)
 
-# Flags de compilação da OpenOrbis (PS4)
+# Flags de compilação da OpenOrbis (PS4 - AMD Jaguar btver2 otimizado)
 set(ORBIS_CFLAGS
     "-target" "x86_64-pc-freebsd12-elf"
+    "-O3"
+    "-march=btver2"
+    "-mtune=btver2"
+    "-ffast-math"
+    "-funroll-loops"
+    "-fomit-frame-pointer"
     "-fPIC"
     "-funwind-tables"
     "-isysroot" "${OO_PS4_TOOLCHAIN}"
     "-isystem" "${OO_PS4_TOOLCHAIN}/include"
     "-D__ORBIS__"
     "-D__PS4__"
+    "-DNDEBUG"
 )
 add_compile_options(${ORBIS_CFLAGS})
 
@@ -61,10 +68,13 @@ file(WRITE "${CMAKE_BINARY_DIR}/mgba_gen/mgba/core/version.h" "
 ")
 
 # Evita conflito de typedef locale_t com alltypes.h sem puxar TLS (.tbss) da libc
+# e desativa mmap em file descriptors (_POSIX_MAPPED_FILES) no Orbis OS
 file(WRITE "${CMAKE_BINARY_DIR}/mgba_gen/ps4_compat.h" "
 #ifndef PS4_COMPAT_H
 #define PS4_COMPAT_H
 #include <stdlib.h>
+#include <unistd.h>
+#undef _POSIX_MAPPED_FILES
 #include <locale.h>
 #define locale_t mgba_locale_t
 #endif
@@ -135,10 +145,10 @@ target_include_directories(mgba_core PUBLIC
 target_compile_options(mgba_core PRIVATE "-include" "${CMAKE_BINARY_DIR}/mgba_gen/ps4_compat.h")
 
 # Flags críticas para enxugar o mGBA ao osso (apenas GBA, 32-bit color, sem threads extras)
+# IMPORTANTE: NAO definir COLOR_16_BIT (image.h usa #ifdef COLOR_16_BIT; defini-lo ativa 16-bit!)
 target_compile_definitions(mgba_core PUBLIC
     M_CORE_GBA
     MINIMAL_CORE=2
-    COLOR_16_BIT=0
     DISABLE_THREADING
     ENABLE_VFS
     ENABLE_VFS_FD

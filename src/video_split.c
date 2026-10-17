@@ -9,14 +9,33 @@
 
 #define PS4_VIDEO_PIXEL_FORMAT_ARGB_SRGB 0x80000000U
 #define FRAME_BYTES (PS4_SCREEN_WIDTH * PS4_SCREEN_HEIGHT * sizeof(uint32_t))
+#define NUM_FRAMEBUFFERS 3
 
 static off_t s_direct_mem_offset = 0;
 static size_t s_total_alloc_size = 0;
-static void* s_framebuffers[2] = { NULL, NULL };
+static void* s_framebuffers[NUM_FRAMEBUFFERS] = { NULL, NULL, NULL };
 static int32_t s_video_handle = -1;
 static OrbisKernelEqueue s_flip_queue = 0;
 static int s_buffer_index = 0;
 static int64_t s_flip_arg = 1;
+static int64_t s_submitted_flip_arg = 0;
+static int s_clear_frames_remaining = NUM_FRAMEBUFFERS;
+static int s_prev_active_count = -1;
+static int s_prev_audio_focus = -1;
+static bool s_prev_focus_highlight = false;
+static bool s_prev_osd_open = false;
+static UIAppState s_prev_ui_state = UI_STATE_LAUNCHER;
+
+/*
+ * Converts 2 packed mGBA 32-bit XBGR8 pixels (0x00BBGGRR_00BBGGRR)
+ * into 2 packed PS4 ARGB8 pixels (0xFFRRGGBB_FFRRGGBB) in 4 bitwise ops.
+ */
+static inline uint64_t xbgr2_to_argb2(uint64_t p01) {
+    uint64_t ag = (p01 & 0x0000FF000000FF00ULL) | 0xFF000000FF000000ULL;
+    uint64_t r  = (p01 & 0x000000FF000000FFULL) << 16;
+    uint64_t b  = (p01 & 0x00FF000000FF0000ULL) >> 16;
+    return ag | r | b;
+}
 
 /*
  * Fast 3x nearest-neighbor scaler (240x160 -> 720x480)
@@ -37,13 +56,16 @@ static inline void blit_3x_wc64(
         uint64_t* __restrict d1 = (uint64_t*)(dst_base + PS4_SCREEN_WIDTH);
         uint64_t* __restrict d2 = (uint64_t*)(dst_base + PS4_SCREEN_WIDTH * 2);
 
-        const uint32_t* __restrict s = src_row;
+        const uint64_t* __restrict s64 = (const uint64_t*)src_row;
         for (int i = 0; i < (GBA_SCREEN_WIDTH / 4); ++i) {
-            uint64_t p0 = s[0];
-            uint64_t p1 = s[1];
-            uint64_t p2 = s[2];
-            uint64_t p3 = s[3];
-            s += 4;
+            uint64_t p01 = xbgr2_to_argb2(s64[0]);
+            uint64_t p23 = xbgr2_to_argb2(s64[1]);
+            s64 += 2;
+
+            uint64_t p0 = (uint32_t)p01;
+            uint64_t p1 = p01 >> 32;
+            uint64_t p2 = (uint32_t)p23;
+            uint64_t p3 = p23 >> 32;
 
             uint64_t w0 = (p0 << 32) | p0;
             uint64_t w1 = (p1 << 32) | p0;
@@ -90,13 +112,16 @@ static inline void blit_4x_wc64(
         uint64_t* __restrict d2 = (uint64_t*)(dst_base + PS4_SCREEN_WIDTH * 2);
         uint64_t* __restrict d3 = (uint64_t*)(dst_base + PS4_SCREEN_WIDTH * 3);
 
-        const uint32_t* __restrict s = src_row;
+        const uint64_t* __restrict s64 = (const uint64_t*)src_row;
         for (int i = 0; i < (GBA_SCREEN_WIDTH / 4); ++i) {
-            uint64_t p0 = s[0];
-            uint64_t p1 = s[1];
-            uint64_t p2 = s[2];
-            uint64_t p3 = s[3];
-            s += 4;
+            uint64_t p01 = xbgr2_to_argb2(s64[0]);
+            uint64_t p23 = xbgr2_to_argb2(s64[1]);
+            s64 += 2;
+
+            uint64_t p0 = (uint32_t)p01;
+            uint64_t p1 = p01 >> 32;
+            uint64_t p2 = (uint32_t)p23;
+            uint64_t p3 = p23 >> 32;
 
             uint64_t w0 = (p0 << 32) | p0;
             uint64_t w1 = (p1 << 32) | p1;
@@ -147,11 +172,13 @@ static inline void blit_6x_wc64(
         uint64_t* __restrict d4 = (uint64_t*)(dst_base + PS4_SCREEN_WIDTH * 4);
         uint64_t* __restrict d5 = (uint64_t*)(dst_base + PS4_SCREEN_WIDTH * 5);
 
-        const uint32_t* __restrict s = src_row;
+        const uint64_t* __restrict s64 = (const uint64_t*)src_row;
         for (int i = 0; i < (GBA_SCREEN_WIDTH / 2); ++i) {
-            uint64_t p0 = s[0];
-            uint64_t p1 = s[1];
-            s += 2;
+            uint64_t p01 = xbgr2_to_argb2(s64[0]);
+            s64 += 1;
+
+            uint64_t p0 = (uint32_t)p01;
+            uint64_t p1 = p01 >> 32;
 
             uint64_t w0 = (p0 << 32) | p0;
             uint64_t w1 = (p1 << 32) | p1;
@@ -271,7 +298,7 @@ bool video_init(void) {
     }
     sceVideoOutAddFlipEvent(s_flip_queue, s_video_handle, NULL);
 
-    size_t total_size = FRAME_BYTES * 2;
+    size_t total_size = FRAME_BYTES * NUM_FRAMEBUFFERS;
     total_size = (total_size + 0x1FFFFF) & ~((size_t)0x1FFFFF);
     s_total_alloc_size = total_size;
 
@@ -294,8 +321,9 @@ bool video_init(void) {
         return false;
     }
 
-    s_framebuffers[0] = base_addr;
-    s_framebuffers[1] = (void*)((uintptr_t)base_addr + FRAME_BYTES);
+    for (int i = 0; i < NUM_FRAMEBUFFERS; ++i) {
+        s_framebuffers[i] = (void*)((uintptr_t)base_addr + (size_t)i * FRAME_BYTES);
+    }
     memset(s_framebuffers[0], 0, total_size);
 
     OrbisVideoOutBufferAttribute attr;
@@ -311,7 +339,7 @@ bool video_init(void) {
         PS4_SCREEN_WIDTH
     );
 
-    ret = sceVideoOutRegisterBuffers(s_video_handle, 0, s_framebuffers, 2, &attr);
+    ret = sceVideoOutRegisterBuffers(s_video_handle, 0, s_framebuffers, NUM_FRAMEBUFFERS, &attr);
     if (ret < 0) {
         video_shutdown();
         return false;
@@ -322,6 +350,8 @@ bool video_init(void) {
 
     s_buffer_index = 0;
     s_flip_arg = 1;
+    s_submitted_flip_arg = 0;
+    s_clear_frames_remaining = NUM_FRAMEBUFFERS;
     return true;
 }
 
@@ -331,21 +361,46 @@ void video_render_split_screen(struct PS4GBA_Context* ctx) {
         return;
     }
 
-    if (ui_menu_get_state() == UI_STATE_LAUNCHER) {
+    UIAppState ui_state = ui_menu_get_state();
+    if (ui_state == UI_STATE_LAUNCHER) {
+        s_prev_ui_state = ui_state;
+        s_clear_frames_remaining = NUM_FRAMEBUFFERS;
         ui_menu_render_launcher(back_buffer);
+        if (s_submitted_flip_arg > 0) {
+            wait_for_flip(s_submitted_flip_arg);
+        }
         int64_t flip_id = s_flip_arg++;
         sceVideoOutSubmitFlip(s_video_handle, s_buffer_index,
                               ORBIS_VIDEO_OUT_FLIP_VSYNC, flip_id);
-        wait_for_flip(flip_id);
-        s_buffer_index ^= 1;
+        s_submitted_flip_arg = flip_id;
+        s_buffer_index = (s_buffer_index + 1) % NUM_FRAMEBUFFERS;
         return;
     }
-
-    memset(back_buffer, 0, FRAME_BYTES);
 
     int active_count = ctx ? ctx->active_count : 0;
     int audio_focus = audio_get_focus_player();
     bool focus_highlight = (audio_get_mode() == PS4_AUDIO_MODE_FOCUS);
+    bool osd_open = ui_menu_is_osd_open();
+
+    if (s_prev_ui_state != ui_state ||
+        s_prev_active_count != active_count ||
+        s_prev_audio_focus != audio_focus ||
+        s_prev_focus_highlight != focus_highlight ||
+        s_prev_osd_open != osd_open) {
+        s_clear_frames_remaining = NUM_FRAMEBUFFERS;
+        s_prev_ui_state = ui_state;
+        s_prev_active_count = active_count;
+        s_prev_audio_focus = audio_focus;
+        s_prev_focus_highlight = focus_highlight;
+        s_prev_osd_open = osd_open;
+    }
+
+    if (osd_open || s_clear_frames_remaining > 0) {
+        memset(back_buffer, 0, FRAME_BYTES);
+        if (!osd_open && s_clear_frames_remaining > 0) {
+            s_clear_frames_remaining--;
+        }
+    }
 
     static const uint32_t player_colors[GBA_MAX_INSTANCES] = {
         0xFF00F5D4U, /* P1: Cyan   */
@@ -392,15 +447,19 @@ void video_render_split_screen(struct PS4GBA_Context* ctx) {
         }
     }
 
-    if (ui_menu_is_osd_open()) {
+    if (osd_open) {
         ui_menu_render_osd(back_buffer, ctx);
     }
 
+    /* Wait for previous VSync flip before submitting current buffer so CPU emulation overlaps VSync wait */
+    if (s_submitted_flip_arg > 0) {
+        wait_for_flip(s_submitted_flip_arg);
+    }
     int64_t flip_id = s_flip_arg++;
     sceVideoOutSubmitFlip(s_video_handle, s_buffer_index,
                           ORBIS_VIDEO_OUT_FLIP_VSYNC, flip_id);
-    wait_for_flip(flip_id);
-    s_buffer_index ^= 1;
+    s_submitted_flip_arg = flip_id;
+    s_buffer_index = (s_buffer_index + 1) % NUM_FRAMEBUFFERS;
 }
 
 void video_shutdown(void) {
@@ -414,8 +473,9 @@ void video_shutdown(void) {
     }
     if (s_framebuffers[0]) {
         sceKernelReleaseDirectMemory(s_direct_mem_offset, s_total_alloc_size);
-        s_framebuffers[0] = NULL;
-        s_framebuffers[1] = NULL;
+        for (int i = 0; i < NUM_FRAMEBUFFERS; ++i) {
+            s_framebuffers[i] = NULL;
+        }
         s_direct_mem_offset = 0;
         s_total_alloc_size = 0;
     }

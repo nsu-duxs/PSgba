@@ -6,7 +6,7 @@
 #include "emulator_manager.h"
 
 #define PS4_AUDIO_SAMPLE_RATE 48000
-#define PS4_AUDIO_GRANULARITY 1024
+#define PS4_AUDIO_GRANULARITY 256
 #define GBA_AUDIO_BUFFER_SIZE 2048
 
 typedef enum PS4AudioMode {
