@@ -510,8 +510,20 @@ void ui_menu_render_osd(uint32_t* fb, struct PS4GBA_Context* ctx) {
                      sel ? 0xFF00F5D4U : 0xFFE0E0E0U, 2);
     }
 
+    /* Telemetria do Link Cable */
+    uint32_t xfer_pkts = link_hub_get_transfer_count();
+    int m0 = link_hub_get_player_mode(0);
+    int m1 = link_hub_get_player_mode(1);
+    const char* mode0_str = (m0 == GBA_SIO_MULTI) ? "MULTI" : (m0 == GBA_SIO_NORMAL_32) ? "NORM32" : (m0 == GBA_SIO_NORMAL_8) ? "NORM8" : "IDLE";
+    const char* mode1_str = (m1 == GBA_SIO_MULTI) ? "MULTI" : (m1 == GBA_SIO_NORMAL_32) ? "NORM32" : (m1 == GBA_SIO_NORMAL_8) ? "NORM8" : "IDLE";
+
+    char link_info[128];
+    snprintf(link_info, sizeof(link_info), "Status Link: P1 [%s]  P2 [%s]  |  Pacotes: %u",
+             mode0_str, mode1_str, xfer_pkts);
+    ui_draw_text(fb, box_x + 50, box_y + 616, link_info, 0xFF00F5D4U, 2);
+
     if (s_osd_status[0]) {
-        ui_draw_text(fb, box_x + 50, box_y + 660, s_osd_status, 0xFF38B000U, 2);
+        ui_draw_text(fb, box_x + 50, box_y + 665, s_osd_status, 0xFF38B000U, 2);
     }
 
     ui_draw_text(fb, box_x + 50, box_y + 720,

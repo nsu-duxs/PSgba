@@ -185,7 +185,6 @@ bool emulator_init_session(const char* const rom_paths[GBA_MAX_INSTANCES], int n
 
         /* Reset core BEFORE attaching Link Cable SIO driver so GBASIOReset doesn't clobber it */
         core->reset(core);
-        link_hub_attach_instance(i, core);
 
         g_gba_ctx.instances[i].core = core;
         g_gba_ctx.instances[i].video_buffer = vbuf;
@@ -193,7 +192,12 @@ bool emulator_init_session(const char* const rom_paths[GBA_MAX_INSTANCES], int n
         g_gba_ctx.active_count++;
     }
 
-    link_hub_reset();
+    struct mCore* active_cores[GBA_MAX_INSTANCES];
+    for (int i = 0; i < num_players; ++i) {
+        active_cores[i] = g_gba_ctx.instances[i].core;
+    }
+    link_hub_attach(active_cores, num_players);
+
     return (g_gba_ctx.active_count > 0);
 }
 
@@ -234,6 +238,8 @@ void emulator_step_lockstep_frame(void) {
         finish_instance_frame(first_active);
         return;
     }
+
+    link_hub_begin_frame();
 
     /* Adaptive lockstep for 2P-4P: 1-scanline slices during Link Cable I/O, 16-scanline slices when idle */
     uint32_t slice_target = 0;
