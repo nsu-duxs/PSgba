@@ -23,8 +23,10 @@ struct PS4LinkHub {
     int active_count;
     uint32_t transfer_count;
     uint16_t multi_data[LINK_MAX_PLAYERS];
+    uint16_t pending_multi_send[LINK_MAX_PLAYERS];
     uint8_t normal8_data[LINK_MAX_PLAYERS];
     uint32_t normal32_data[LINK_MAX_PLAYERS];
+    bool transfer_in_progress;
     volatile int active_transfer_lines;
 };
 

@@ -6,154 +6,120 @@
 PS4LinkHub g_link_hub = {0};
 
 /*
- * Transferência síncrona de Multiplayer (GBA_SIO_MULTI):
- * O Master (Instância 0) aciona a transferência quando o bit de Start/Busy é ativado.
- * Os dados enviados (SIOMLT_SEND) de todas as instâncias ativas são lidos para o hub,
- * escritos em SIOMULTI0..3 de cada GBA, o bit Busy é limpo e a interrupção serial (IRQ_SIO)
- * é disparada em todos os núcleos.
+ * Verifica se TODAS as instâncias ativas já entraram no modo GBA_SIO_MULTI.
+ * No hardware real do GBA, a linha SD (Bit 3 de SIOCNT - "All GBAs Ready")
+ * só fica em nível alto (1) quando todos os consoles conectados na cadeia
+ * configuraram RCNT com bit 15 = 0 e SIOCNT com bits 12..13 = 10 (Multi).
  */
-static void _link_hub_transfer_multi(PS4LinkHub* hub) {
+static bool _link_hub_all_in_multi(const PS4LinkHub* hub) {
+    if (!hub || hub->active_count < 2) {
+        return false;
+    }
+    for (int i = 0; i < hub->active_count; ++i) {
+        struct GBA* g = hub->gba[i];
+        if (!g || g->sio.mode != GBA_SIO_MULTI) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/*
+ * Verifica se ao menos 2 instâncias estão em modos compatíveis de Link.
+ */
+static bool _link_hub_has_peers(const PS4LinkHub* hub) {
+    return (hub && hub->active_count >= 2);
+}
+
+/*
+ * Propaga a cadeia GPIO (Daisy-Chain) quando os consoles estão em modo RCNT GPIO (0x8000):
+ * O pino SO (Bit 3) do Jogador (i - 1) alimenta o pino SI (Bit 2) do Jogador (i).
+ * O Jogador 0 (Master) tem seu pino SI permanentemente em GND (0).
+ */
+static void _link_hub_sync_gpio_chain(PS4LinkHub* hub) {
     if (!hub || hub->active_count < 2) {
         return;
     }
 
-    int count = hub->active_count;
-    if (count > LINK_MAX_PLAYERS) {
-        count = LINK_MAX_PLAYERS;
-    }
-
-    /* 1. Copia dados enviados (SIOMLT_SEND) de cada instância para os buffers do hub */
-    for (int i = 0; i < LINK_MAX_PLAYERS; ++i) {
-        if (i < count && hub->gba[i]) {
-            hub->multi_data[i] = hub->gba[i]->memory.io[GBA_REG(SIOMLT_SEND)];
-        } else {
-            hub->multi_data[i] = 0xFFFF;
-        }
-    }
-
-    /* 2. Distribui para os registradores de recepção (SIOMULTI0..3) de cada instância */
-    for (int i = 0; i < count; ++i) {
+    for (int i = 0; i < hub->active_count; ++i) {
         struct GBA* g = hub->gba[i];
         if (!g) {
             continue;
         }
 
-        g->memory.io[GBA_REG(SIOMULTI0)] = hub->multi_data[0];
-        g->memory.io[GBA_REG(SIOMULTI1)] = hub->multi_data[1];
-        g->memory.io[GBA_REG(SIOMULTI2)] = hub->multi_data[2];
-        g->memory.io[GBA_REG(SIOMULTI3)] = hub->multi_data[3];
+        int si_level = 0;
+        if (i > 0) {
+            struct GBA* prev = hub->gba[i - 1];
+            if (prev) {
+                /* Se o console anterior estiver em GPIO e tiver SO como saída/alto, propaga para SI */
+                uint16_t prev_rcnt = prev->sio.rcnt;
+                if (prev->sio.mode == GBA_SIO_GPIO) {
+                    si_level = (prev_rcnt & 0x0008) ? 1 : 0;
+                } else {
+                    si_level = 1;
+                }
+            } else {
+                si_level = 1;
+            }
+        }
 
-        /* Limpa o bit de Busy (0x80), garante bit Ready (0x08) ativado e atualiza ID/Slave */
-        uint16_t scnt = g->sio.siocnt;
-        scnt &= ~0x0080;
-        scnt |= 0x0008;
-        scnt = GBASIOMultiplayerSetId(scnt, i);
-        scnt = GBASIOMultiplayerSetSlave(scnt, i != 0);
-        scnt = GBASIOMultiplayerClearError(scnt);
-        g->sio.siocnt = scnt;
-        g->memory.io[GBA_REG(SIOCNT)] = scnt;
-
-        /* Atualiza RCNT: SC=1, SD=1 (Ready), SI=(i!=0) */
-        g->sio.rcnt = GBASIORegisterRCNTFillSc(g->sio.rcnt);
-        g->sio.rcnt = GBASIORegisterRCNTSetSi(g->sio.rcnt, i != 0);
-        g->sio.rcnt = GBASIORegisterRCNTSetSd(g->sio.rcnt, 1);
-        g->memory.io[GBA_REG(RCNT)] = g->sio.rcnt;
-
-        /* Dispara interrupção serial no registrador IF e agenda IRQ */
-        g->memory.io[GBA_REG(IF)] |= (1 << GBA_IRQ_SIO);
-        if (GBASIOMultiplayerIsIrq(scnt)) {
-            GBARaiseIRQ(g, GBA_IRQ_SIO, 0);
+        if (g->sio.mode == GBA_SIO_GPIO) {
+            if (si_level) {
+                g->sio.rcnt |= 0x0004;
+            } else {
+                g->sio.rcnt &= ~0x0004;
+            }
+            g->memory.io[GBA_REG(RCNT)] = g->sio.rcnt;
         }
     }
-
-    hub->transfer_count++;
-    __atomic_store_n(&hub->active_transfer_lines, 4, __ATOMIC_RELEASE);
 }
 
 /*
- * Transferência síncrona Normal 32-bit (GBA_SIO_NORMAL_32)
+ * Sincroniza o estado dos pinos SI, SD e Player ID de todas as instâncias
+ * que estão atualmente em modo GBA_SIO_MULTI.
  */
-static void _link_hub_transfer_normal32(PS4LinkHub* hub) {
-    if (!hub || hub->active_count < 2) {
+static void _link_hub_refresh_multi_status(PS4LinkHub* hub) {
+    if (!hub) {
         return;
     }
 
-    struct GBA* g0 = hub->gba[0];
-    struct GBA* g1 = hub->gba[1];
-    if (!g0 || !g1) {
-        return;
+    bool all_multi = _link_hub_all_in_multi(hub);
+
+    for (int i = 0; i < hub->active_count; ++i) {
+        struct GBA* g = hub->gba[i];
+        if (!g) {
+            continue;
+        }
+
+        /* Atualiza RCNT: SC=1, SD=(all_multi), SI=(i != 0) */
+        uint16_t rcnt = g->sio.rcnt;
+        if (g->sio.mode != GBA_SIO_GPIO) {
+            rcnt = GBASIORegisterRCNTFillSc(rcnt);
+            rcnt = GBASIORegisterRCNTSetSi(rcnt, i != 0);
+            rcnt = GBASIORegisterRCNTSetSd(rcnt, all_multi ? 1 : 0);
+            g->sio.rcnt = rcnt;
+            g->memory.io[GBA_REG(RCNT)] = rcnt;
+        }
+
+        if (g->sio.mode == GBA_SIO_MULTI) {
+            uint16_t scnt = g->sio.siocnt;
+            if (all_multi) {
+                scnt = GBASIOMultiplayerFillReady(scnt); /* Bit 3 (SD) = 1 */
+            } else {
+                scnt = GBASIOMultiplayerClearReady(scnt); /* Bit 3 (SD) = 0 */
+            }
+            scnt = GBASIOMultiplayerSetSlave(scnt, i != 0); /* Bit 2 (SI): 0=Master, 1=Slave */
+            scnt = GBASIOMultiplayerSetId(scnt, i);         /* Bits 4..5: ID 0..3 */
+            scnt = GBASIOMultiplayerClearError(scnt);       /* Bit 6 (Error) = 0 */
+
+            if (hub->transfer_in_progress) {
+                scnt = GBASIOMultiplayerFillBusy(scnt);
+            }
+
+            g->sio.siocnt = scnt;
+            g->memory.io[GBA_REG(SIOCNT)] = scnt;
+        }
     }
-
-    uint32_t d0 = (uint32_t)g0->memory.io[GBA_REG(SIODATA32_LO)] |
-                  ((uint32_t)g0->memory.io[GBA_REG(SIODATA32_HI)] << 16);
-    uint32_t d1 = (uint32_t)g1->memory.io[GBA_REG(SIODATA32_LO)] |
-                  ((uint32_t)g1->memory.io[GBA_REG(SIODATA32_HI)] << 16);
-
-    hub->normal32_data[0] = d0;
-    hub->normal32_data[1] = d1;
-
-    /* Instância 0 recebe d1 */
-    g0->memory.io[GBA_REG(SIODATA32_LO)] = (uint16_t)(d1 & 0xFFFF);
-    g0->memory.io[GBA_REG(SIODATA32_HI)] = (uint16_t)(d1 >> 16);
-    g0->sio.siocnt &= ~0x0080;
-    g0->memory.io[GBA_REG(SIOCNT)] = g0->sio.siocnt;
-    g0->memory.io[GBA_REG(IF)] |= (1 << GBA_IRQ_SIO);
-    if (GBASIONormalIsIrq(g0->sio.siocnt)) {
-        GBARaiseIRQ(g0, GBA_IRQ_SIO, 0);
-    }
-
-    /* Instância 1 recebe d0 */
-    g1->memory.io[GBA_REG(SIODATA32_LO)] = (uint16_t)(d0 & 0xFFFF);
-    g1->memory.io[GBA_REG(SIODATA32_HI)] = (uint16_t)(d0 >> 16);
-    g1->sio.siocnt &= ~0x0080;
-    g1->memory.io[GBA_REG(SIOCNT)] = g1->sio.siocnt;
-    g1->memory.io[GBA_REG(IF)] |= (1 << GBA_IRQ_SIO);
-    if (GBASIONormalIsIrq(g1->sio.siocnt)) {
-        GBARaiseIRQ(g1, GBA_IRQ_SIO, 0);
-    }
-
-    hub->transfer_count++;
-    __atomic_store_n(&hub->active_transfer_lines, 4, __ATOMIC_RELEASE);
-}
-
-/*
- * Transferência síncrona Normal 8-bit (GBA_SIO_NORMAL_8)
- */
-static void _link_hub_transfer_normal8(PS4LinkHub* hub) {
-    if (!hub || hub->active_count < 2) {
-        return;
-    }
-
-    struct GBA* g0 = hub->gba[0];
-    struct GBA* g1 = hub->gba[1];
-    if (!g0 || !g1) {
-        return;
-    }
-
-    uint8_t d0 = (uint8_t)(g0->memory.io[GBA_REG(SIODATA8)] & 0xFF);
-    uint8_t d1 = (uint8_t)(g1->memory.io[GBA_REG(SIODATA8)] & 0xFF);
-
-    hub->normal8_data[0] = d0;
-    hub->normal8_data[1] = d1;
-
-    g0->memory.io[GBA_REG(SIODATA8)] = d1;
-    g0->sio.siocnt &= ~0x0080;
-    g0->memory.io[GBA_REG(SIOCNT)] = g0->sio.siocnt;
-    g0->memory.io[GBA_REG(IF)] |= (1 << GBA_IRQ_SIO);
-    if (GBASIONormalIsIrq(g0->sio.siocnt)) {
-        GBARaiseIRQ(g0, GBA_IRQ_SIO, 0);
-    }
-
-    g1->memory.io[GBA_REG(SIODATA8)] = d0;
-    g1->sio.siocnt &= ~0x0080;
-    g1->memory.io[GBA_REG(SIOCNT)] = g1->sio.siocnt;
-    g1->memory.io[GBA_REG(IF)] |= (1 << GBA_IRQ_SIO);
-    if (GBASIONormalIsIrq(g1->sio.siocnt)) {
-        GBARaiseIRQ(g1, GBA_IRQ_SIO, 0);
-    }
-
-    hub->transfer_count++;
-    __atomic_store_n(&hub->active_transfer_lines, 4, __ATOMIC_RELEASE);
 }
 
 /* --- Callbacks de GBASIODriver --- */
@@ -161,11 +127,10 @@ static void _link_hub_transfer_normal8(PS4LinkHub* hub) {
 static bool _link_driver_init(struct GBASIODriver* driver) {
     PS4LinkDriver* self = (PS4LinkDriver*)driver;
     if (driver->p) {
+        bool all_multi = _link_hub_all_in_multi(self->hub);
         driver->p->rcnt = GBASIORegisterRCNTFillSc(driver->p->rcnt);
         driver->p->rcnt = GBASIORegisterRCNTSetSi(driver->p->rcnt, self->player_id != 0);
-        if (self->hub && self->hub->active_count >= 2) {
-            driver->p->rcnt = GBASIORegisterRCNTSetSd(driver->p->rcnt, 1);
-        }
+        driver->p->rcnt = GBASIORegisterRCNTSetSd(driver->p->rcnt, all_multi ? 1 : 0);
     }
     return true;
 }
@@ -181,30 +146,16 @@ static void _link_driver_reset(struct GBASIODriver* driver) {
     }
 
     struct GBA* gba = driver->p->p;
-    bool has_peers = (self->hub && self->hub->active_count >= 2);
 
     gba->memory.io[GBA_REG(SIOMULTI0)] = 0xFFFF;
     gba->memory.io[GBA_REG(SIOMULTI1)] = 0xFFFF;
     gba->memory.io[GBA_REG(SIOMULTI2)] = 0xFFFF;
     gba->memory.io[GBA_REG(SIOMULTI3)] = 0xFFFF;
+    gba->memory.io[GBA_REG(SIOMLT_SEND)] = 0xFFFF;
 
-    uint16_t scnt = 0;
-    if (has_peers) {
-        scnt |= 0x0008; /* Ready / SD */
+    if (self->hub) {
+        _link_hub_refresh_multi_status(self->hub);
     }
-    scnt = GBASIOMultiplayerSetSlave(scnt, self->player_id != 0);
-    scnt = GBASIOMultiplayerSetId(scnt, self->player_id);
-    driver->p->siocnt = scnt;
-    gba->memory.io[GBA_REG(SIOCNT)] = scnt;
-
-    uint16_t rcnt = driver->p->rcnt;
-    rcnt = GBASIORegisterRCNTFillSc(rcnt);
-    rcnt = GBASIORegisterRCNTSetSi(rcnt, self->player_id != 0);
-    if (has_peers) {
-        rcnt = GBASIORegisterRCNTSetSd(rcnt, 1);
-    }
-    driver->p->rcnt = rcnt;
-    gba->memory.io[GBA_REG(RCNT)] = rcnt;
 }
 
 static void _link_driver_set_mode(struct GBASIODriver* driver, enum GBASIOMode mode) {
@@ -213,35 +164,18 @@ static void _link_driver_set_mode(struct GBASIODriver* driver, enum GBASIOMode m
         return;
     }
 
-    struct GBA* gba = driver->p->p;
-    bool has_peers = (self->hub->active_count >= 2);
-
-    if (mode == GBA_SIO_MULTI) {
-        uint16_t scnt = driver->p->siocnt;
-        if (has_peers) {
-            scnt |= 0x0008; /* Ready */
-        }
-        scnt = GBASIOMultiplayerSetSlave(scnt, self->player_id != 0);
-        scnt = GBASIOMultiplayerSetId(scnt, self->player_id);
-        scnt = GBASIOMultiplayerClearError(scnt);
-        scnt &= ~0x0080;
-        driver->p->siocnt = scnt;
-        gba->memory.io[GBA_REG(SIOCNT)] = scnt;
-
-        uint16_t rcnt = driver->p->rcnt;
-        rcnt = GBASIORegisterRCNTFillSc(rcnt);
-        rcnt = GBASIORegisterRCNTSetSi(rcnt, self->player_id != 0);
-        if (has_peers) {
-            rcnt = GBASIORegisterRCNTSetSd(rcnt, 1);
-        }
-        driver->p->rcnt = rcnt;
-        gba->memory.io[GBA_REG(RCNT)] = rcnt;
+    if (mode == GBA_SIO_GPIO) {
+        _link_hub_sync_gpio_chain(self->hub);
     }
+    /* Sempre que qualquer GBA muda de modo, atualiza o bit SD (All Ready) de todos */
+    _link_hub_refresh_multi_status(self->hub);
+    __atomic_store_n(&self->hub->active_transfer_lines, 8, __ATOMIC_RELEASE);
 }
 
 static bool _link_driver_handles_mode(struct GBASIODriver* driver, enum GBASIOMode mode) {
     (void)driver;
     switch (mode) {
+    case GBA_SIO_GPIO:
     case GBA_SIO_MULTI:
     case GBA_SIO_NORMAL_8:
     case GBA_SIO_NORMAL_32:
@@ -266,10 +200,24 @@ static int _link_driver_device_id(struct GBASIODriver* driver) {
 
 static uint16_t _link_driver_write_rcnt(struct GBASIODriver* driver, uint16_t value) {
     PS4LinkDriver* self = (PS4LinkDriver*)driver;
+    PS4LinkHub* hub = self->hub;
+
+    if (driver->p && driver->p->mode == GBA_SIO_GPIO) {
+        driver->p->rcnt = value;
+        if (hub) {
+            _link_hub_sync_gpio_chain(hub);
+            __atomic_store_n(&hub->active_transfer_lines, 8, __ATOMIC_RELEASE);
+        }
+        return driver->p->rcnt;
+    }
+
+    bool all_multi = _link_hub_all_in_multi(hub);
     value = GBASIORegisterRCNTFillSc(value);
     value = GBASIORegisterRCNTSetSi(value, self->player_id != 0);
-    if (self->hub && self->hub->active_count >= 2) {
-        value = GBASIORegisterRCNTSetSd(value, 1);
+    value = GBASIORegisterRCNTSetSd(value, all_multi ? 1 : 0);
+
+    if (hub) {
+        _link_hub_refresh_multi_status(hub);
     }
     return value;
 }
@@ -281,92 +229,264 @@ static uint16_t _link_driver_write_siocnt(struct GBASIODriver* driver, uint16_t 
         return value;
     }
 
-    bool has_peers = (hub->active_count >= 2);
     enum GBASIOMode mode = driver->p->mode;
 
     if (mode == GBA_SIO_MULTI) {
-        if (has_peers) {
-            value |= 0x0008; /* Ready (SD) ativo para todos os jogadores conectados */
+        bool all_multi = _link_hub_all_in_multi(hub);
+        if (all_multi) {
+            value = GBASIOMultiplayerFillReady(value);
+        } else {
+            value = GBASIOMultiplayerClearReady(value);
         }
+
         value = GBASIOMultiplayerSetSlave(value, self->player_id != 0);
         value = GBASIOMultiplayerSetId(value, self->player_id);
         value = GBASIOMultiplayerClearError(value);
 
-        /* Se o Master (Instância 0) acionar a transferência (bit Start/Busy ativo) */
-        if (self->player_id == 0 && (value & 0x0080)) {
-            _link_hub_transfer_multi(hub);
-            value &= ~0x0080; /* Limpa Busy após transferência síncrona */
-        } else if (self->player_id != 0) {
-            value &= ~0x0080; /* Slaves não acionam clock de transferência */
+        if (self->player_id != 0) {
+            /* Slaves não iniciam o clock; refletem apenas o estado Busy do Master */
+            if (hub->transfer_in_progress) {
+                value = GBASIOMultiplayerFillBusy(value);
+            } else {
+                value = GBASIOMultiplayerClearBusy(value);
+            }
         }
 
-        /* Mantém RCNT em conformidade */
+        /* Mantém RCNT sincronizado */
         driver->p->rcnt = GBASIORegisterRCNTFillSc(driver->p->rcnt);
         driver->p->rcnt = GBASIORegisterRCNTSetSi(driver->p->rcnt, self->player_id != 0);
-        if (has_peers) {
-            driver->p->rcnt = GBASIORegisterRCNTSetSd(driver->p->rcnt, 1);
-        }
+        driver->p->rcnt = GBASIORegisterRCNTSetSd(driver->p->rcnt, all_multi ? 1 : 0);
         if (driver->p->p) {
             driver->p->p->memory.io[GBA_REG(RCNT)] = driver->p->rcnt;
         }
+
+        __atomic_store_n(&hub->active_transfer_lines, 16, __ATOMIC_RELEASE);
         return value;
     }
 
-    if (mode == GBA_SIO_NORMAL_32) {
-        value = GBASIONormalSetSi(value, !has_peers);
-        if (self->player_id == 0 && (value & 0x0080)) {
-            _link_hub_transfer_normal32(hub);
-            value &= ~0x0080;
-        } else if (self->player_id != 0) {
-            value &= ~0x0080;
+    if (mode == GBA_SIO_NORMAL_32 || mode == GBA_SIO_NORMAL_8) {
+        bool has_peers = _link_hub_has_peers(hub);
+        value = GBASIONormalSetSi(value, self->player_id != 0 ? 1 : (!has_peers ? 1 : 0));
+        if (self->player_id != 0 && !hub->transfer_in_progress) {
+            value = GBASIONormalClearStart(value);
         }
-        return value;
-    }
-
-    if (mode == GBA_SIO_NORMAL_8) {
-        value = GBASIONormalSetSi(value, !has_peers);
-        if (self->player_id == 0 && (value & 0x0080)) {
-            _link_hub_transfer_normal8(hub);
-            value &= ~0x0080;
-        } else if (self->player_id != 0) {
-            value &= ~0x0080;
-        }
+        __atomic_store_n(&hub->active_transfer_lines, 16, __ATOMIC_RELEASE);
         return value;
     }
 
     return value;
 }
 
+/*
+ * _link_driver_start é invocado pelo mGBA quando o bit Start/Busy (0x0080) é ativado em SIOCNT.
+ * Retornando `true` para o Master (player_id == 0), o mGBA agenda `completeEvent` no mTiming
+ * com a latência exata de ciclos do Baud Rate selecionado, evitando o bug de conclusão em 0 ciclos!
+ */
 static bool _link_driver_start(struct GBASIODriver* driver) {
-    (void)driver;
-    /* Retorna false para que o mGBA não agende eventos assíncronos (conclusão em writeSIOCNT) */
+    PS4LinkDriver* self = (PS4LinkDriver*)driver;
+    PS4LinkHub* hub = self->hub;
+    if (!hub || !driver->p) {
+        return false;
+    }
+
+    /* Apenas o Master (Instância 0 / Internal Clock) comanda o início da transferência */
+    if (self->player_id != 0) {
+        return false;
+    }
+
+    enum GBASIOMode mode = driver->p->mode;
+
+    if (mode == GBA_SIO_MULTI) {
+        hub->transfer_in_progress = true;
+        __atomic_store_n(&hub->active_transfer_lines, 16, __ATOMIC_RELEASE);
+
+        /*
+         * No início da transferência no hardware real:
+         * 1. Os registradores SIOMULTI0..3 de todos os GBAs são resetados para 0xFFFF.
+         * 2. O bit Busy (Bit 7) de SIOCNT sobe para 1 em todos os Slaves conectados.
+         */
+        for (int i = 0; i < hub->active_count; ++i) {
+            struct GBA* g = hub->gba[i];
+            if (!g) {
+                continue;
+            }
+            if (g->sio.mode == GBA_SIO_MULTI) {
+                g->memory.io[GBA_REG(SIOMULTI0)] = 0xFFFF;
+                g->memory.io[GBA_REG(SIOMULTI1)] = 0xFFFF;
+                g->memory.io[GBA_REG(SIOMULTI2)] = 0xFFFF;
+                g->memory.io[GBA_REG(SIOMULTI3)] = 0xFFFF;
+
+                g->sio.siocnt = GBASIOMultiplayerFillBusy(g->sio.siocnt);
+                g->sio.siocnt = GBASIOMultiplayerSetId(g->sio.siocnt, i);
+                g->sio.siocnt = GBASIOMultiplayerSetSlave(g->sio.siocnt, i != 0);
+                g->memory.io[GBA_REG(SIOCNT)] = g->sio.siocnt;
+            }
+        }
+        return true; /* Deixa o mTiming do Master agendar _GBASIOComplete */
+    }
+
+    if (mode == GBA_SIO_NORMAL_32 || mode == GBA_SIO_NORMAL_8) {
+        if (!GBASIONormalIsInternalSc(driver->p->siocnt)) {
+            return false;
+        }
+        hub->transfer_in_progress = true;
+        __atomic_store_n(&hub->active_transfer_lines, 16, __ATOMIC_RELEASE);
+        return true;
+    }
+
     return false;
 }
 
+/*
+ * Chamado pelo mTiming do Master (Player 0) após decorrerem os ciclos reais da transferência.
+ * Nesse instante, os Slaves já avançaram em lockstep e escreveram suas respostas em SIOMLT_SEND.
+ */
 static void _link_driver_finish_multiplayer(struct GBASIODriver* driver, uint16_t data[4]) {
     PS4LinkDriver* self = (PS4LinkDriver*)driver;
-    if (!self || !self->hub) {
+    PS4LinkHub* hub = self ? self->hub : NULL;
+    if (!hub) {
+        data[0] = 0xFFFF;
+        data[1] = 0xFFFF;
+        data[2] = 0xFFFF;
+        data[3] = 0xFFFF;
         return;
     }
+
+    bool all_multi = _link_hub_all_in_multi(hub);
+
+    /* 1. Coleta o SIOMLT_SEND atual de cada GBA que está em modo Multiplayer */
     for (int i = 0; i < LINK_MAX_PLAYERS; ++i) {
-        data[i] = self->hub->multi_data[i];
+        if (i < hub->active_count && hub->gba[i] && hub->gba[i]->sio.mode == GBA_SIO_MULTI) {
+            hub->multi_data[i] = hub->gba[i]->memory.io[GBA_REG(SIOMLT_SEND)];
+        } else {
+            hub->multi_data[i] = 0xFFFF;
+        }
+        data[i] = hub->multi_data[i];
     }
+
+    hub->transfer_in_progress = false;
+
+    /*
+     * 2. O mGBA preenche SIOMULTI0..3, limpa Busy e dispara a IRQ para o Master (i == 0)
+     *    imediatamente no retorno desta função.
+     *    Para os Slaves (i >= 1), atualizamos os registradores e disparamos a IRQ agora!
+     */
+    for (int i = 1; i < hub->active_count; ++i) {
+        struct GBA* g = hub->gba[i];
+        if (!g || g->sio.mode != GBA_SIO_MULTI) {
+            continue;
+        }
+
+        g->memory.io[GBA_REG(SIOMULTI0)] = data[0];
+        g->memory.io[GBA_REG(SIOMULTI1)] = data[1];
+        g->memory.io[GBA_REG(SIOMULTI2)] = data[2];
+        g->memory.io[GBA_REG(SIOMULTI3)] = data[3];
+
+        uint16_t scnt = g->sio.siocnt;
+        scnt = GBASIOMultiplayerClearBusy(scnt);
+        if (all_multi) {
+            scnt = GBASIOMultiplayerFillReady(scnt);
+        } else {
+            scnt = GBASIOMultiplayerClearReady(scnt);
+        }
+        scnt = GBASIOMultiplayerSetId(scnt, i);
+        scnt = GBASIOMultiplayerSetSlave(scnt, 1);
+        scnt = GBASIOMultiplayerClearError(scnt);
+        g->sio.siocnt = scnt;
+        g->memory.io[GBA_REG(SIOCNT)] = scnt;
+
+        g->sio.rcnt = GBASIORegisterRCNTFillSc(g->sio.rcnt);
+        g->sio.rcnt = GBASIORegisterRCNTSetSi(g->sio.rcnt, 1);
+        g->sio.rcnt = GBASIORegisterRCNTSetSd(g->sio.rcnt, all_multi ? 1 : 0);
+        g->memory.io[GBA_REG(RCNT)] = g->sio.rcnt;
+
+        if (GBASIOMultiplayerIsIrq(scnt)) {
+            GBARaiseIRQ(g, GBA_IRQ_SIO, 0);
+        }
+    }
+
+    /* Garante que o Master também mantenha SD/ID/Slave corretos após o retorno */
+    if (hub->gba[0]) {
+        struct GBA* g0 = hub->gba[0];
+        if (all_multi) {
+            g0->sio.siocnt = GBASIOMultiplayerFillReady(g0->sio.siocnt);
+        }
+        g0->sio.siocnt = GBASIOMultiplayerSetId(g0->sio.siocnt, 0);
+        g0->sio.siocnt = GBASIOMultiplayerSetSlave(g0->sio.siocnt, 0);
+        g0->sio.siocnt = GBASIOMultiplayerClearError(g0->sio.siocnt);
+    }
+
+    hub->transfer_count++;
+    __atomic_store_n(&hub->active_transfer_lines, 16, __ATOMIC_RELEASE);
 }
 
 static uint8_t _link_driver_finish_normal8(struct GBASIODriver* driver) {
     PS4LinkDriver* self = (PS4LinkDriver*)driver;
-    if (!self || !self->hub || self->player_id == 0) {
+    PS4LinkHub* hub = self ? self->hub : NULL;
+    if (!hub || hub->active_count < 2 || !hub->gba[0] || !hub->gba[1]) {
+        if (hub) {
+            hub->transfer_in_progress = false;
+        }
         return 0xFF;
     }
-    return self->hub->normal8_data[self->player_id - 1];
+
+    struct GBA* g0 = hub->gba[0];
+    struct GBA* g1 = hub->gba[1];
+
+    uint8_t d0 = (uint8_t)(g0->memory.io[GBA_REG(SIODATA8)] & 0xFF);
+    uint8_t d1 = (uint8_t)(g1->memory.io[GBA_REG(SIODATA8)] & 0xFF);
+
+    hub->normal8_data[0] = d0;
+    hub->normal8_data[1] = d1;
+    hub->transfer_in_progress = false;
+
+    /* Atualiza Slave (Player 1) */
+    g1->memory.io[GBA_REG(SIODATA8)] = d0;
+    g1->sio.siocnt = GBASIONormalClearStart(g1->sio.siocnt);
+    g1->memory.io[GBA_REG(SIOCNT)] = g1->sio.siocnt;
+    if (GBASIONormalIsIrq(g1->sio.siocnt)) {
+        GBARaiseIRQ(g1, GBA_IRQ_SIO, 0);
+    }
+
+    hub->transfer_count++;
+    __atomic_store_n(&hub->active_transfer_lines, 16, __ATOMIC_RELEASE);
+    return d1; /* Master recebe d1 */
 }
 
 static uint32_t _link_driver_finish_normal32(struct GBASIODriver* driver) {
     PS4LinkDriver* self = (PS4LinkDriver*)driver;
-    if (!self || !self->hub || self->player_id == 0) {
+    PS4LinkHub* hub = self ? self->hub : NULL;
+    if (!hub || hub->active_count < 2 || !hub->gba[0] || !hub->gba[1]) {
+        if (hub) {
+            hub->transfer_in_progress = false;
+        }
         return 0xFFFFFFFFU;
     }
-    return self->hub->normal32_data[self->player_id - 1];
+
+    struct GBA* g0 = hub->gba[0];
+    struct GBA* g1 = hub->gba[1];
+
+    uint32_t d0 = (uint32_t)g0->memory.io[GBA_REG(SIODATA32_LO)] |
+                  ((uint32_t)g0->memory.io[GBA_REG(SIODATA32_HI)] << 16);
+    uint32_t d1 = (uint32_t)g1->memory.io[GBA_REG(SIODATA32_LO)] |
+                  ((uint32_t)g1->memory.io[GBA_REG(SIODATA32_HI)] << 16);
+
+    hub->normal32_data[0] = d0;
+    hub->normal32_data[1] = d1;
+    hub->transfer_in_progress = false;
+
+    /* Atualiza Slave (Player 1) */
+    g1->memory.io[GBA_REG(SIODATA32_LO)] = (uint16_t)(d0 & 0xFFFF);
+    g1->memory.io[GBA_REG(SIODATA32_HI)] = (uint16_t)(d0 >> 16);
+    g1->sio.siocnt = GBASIONormalClearStart(g1->sio.siocnt);
+    g1->memory.io[GBA_REG(SIOCNT)] = g1->sio.siocnt;
+    if (GBASIONormalIsIrq(g1->sio.siocnt)) {
+        GBARaiseIRQ(g1, GBA_IRQ_SIO, 0);
+    }
+
+    hub->transfer_count++;
+    __atomic_store_n(&hub->active_transfer_lines, 16, __ATOMIC_RELEASE);
+    return d1; /* Master recebe d1 */
 }
 
 /* --- Funções Públicas do Link Hub --- */
@@ -375,14 +495,32 @@ void link_hub_init(void) {
     memset(&g_link_hub, 0, sizeof(g_link_hub));
     for (int i = 0; i < LINK_MAX_PLAYERS; ++i) {
         g_link_hub.multi_data[i] = 0xFFFF;
+        g_link_hub.pending_multi_send[i] = 0xFFFF;
         g_link_hub.normal8_data[i] = 0xFF;
         g_link_hub.normal32_data[i] = 0xFFFFFFFFU;
     }
 }
 
-/*
- * Anexa todos os núcleos ao hub e configura o GBASIODriver em gba->sio.driver.
- */
+static void _setup_driver_callbacks(PS4LinkDriver* drv, int player_id) {
+    memset(drv, 0, sizeof(*drv));
+    drv->hub = &g_link_hub;
+    drv->player_id = player_id;
+
+    drv->d.init = _link_driver_init;
+    drv->d.deinit = _link_driver_deinit;
+    drv->d.reset = _link_driver_reset;
+    drv->d.setMode = _link_driver_set_mode;
+    drv->d.handlesMode = _link_driver_handles_mode;
+    drv->d.connectedDevices = _link_driver_connected_devices;
+    drv->d.deviceId = _link_driver_device_id;
+    drv->d.writeSIOCNT = _link_driver_write_siocnt;
+    drv->d.writeRCNT = _link_driver_write_rcnt;
+    drv->d.start = _link_driver_start;
+    drv->d.finishMultiplayer = _link_driver_finish_multiplayer;
+    drv->d.finishNormal8 = _link_driver_finish_normal8;
+    drv->d.finishNormal32 = _link_driver_finish_normal32;
+}
+
 bool link_hub_attach(struct mCore* cores[], int num_cores) {
     if (!cores || num_cores <= 0) {
         return false;
@@ -402,24 +540,7 @@ bool link_hub_attach(struct mCore* cores[], int num_cores) {
         struct GBA* gba = (struct GBA*)cores[i]->board;
         PS4LinkDriver* drv = &g_link_hub.drivers[i];
 
-        memset(drv, 0, sizeof(*drv));
-        drv->hub = &g_link_hub;
-        drv->player_id = i;
-
-        drv->d.init = _link_driver_init;
-        drv->d.deinit = _link_driver_deinit;
-        drv->d.reset = _link_driver_reset;
-        drv->d.setMode = _link_driver_set_mode;
-        drv->d.handlesMode = _link_driver_handles_mode;
-        drv->d.connectedDevices = _link_driver_connected_devices;
-        drv->d.deviceId = _link_driver_device_id;
-        drv->d.writeSIOCNT = _link_driver_write_siocnt;
-        drv->d.writeRCNT = _link_driver_write_rcnt;
-        drv->d.start = _link_driver_start;
-        drv->d.finishMultiplayer = _link_driver_finish_multiplayer;
-        drv->d.finishNormal8 = _link_driver_finish_normal8;
-        drv->d.finishNormal32 = _link_driver_finish_normal32;
-
+        _setup_driver_callbacks(drv, i);
         g_link_hub.gba[i] = gba;
         GBASIOSetDriver(&gba->sio, &drv->d);
     }
@@ -436,23 +557,7 @@ bool link_hub_attach_instance(int player_id, struct mCore* core) {
     struct GBA* gba = (struct GBA*)core->board;
     PS4LinkDriver* drv = &g_link_hub.drivers[player_id];
 
-    memset(drv, 0, sizeof(*drv));
-    drv->hub = &g_link_hub;
-    drv->player_id = player_id;
-
-    drv->d.init = _link_driver_init;
-    drv->d.deinit = _link_driver_deinit;
-    drv->d.reset = _link_driver_reset;
-    drv->d.setMode = _link_driver_set_mode;
-    drv->d.handlesMode = _link_driver_handles_mode;
-    drv->d.connectedDevices = _link_driver_connected_devices;
-    drv->d.deviceId = _link_driver_device_id;
-    drv->d.writeSIOCNT = _link_driver_write_siocnt;
-    drv->d.writeRCNT = _link_driver_write_rcnt;
-    drv->d.start = _link_driver_start;
-    drv->d.finishMultiplayer = _link_driver_finish_multiplayer;
-    drv->d.finishNormal8 = _link_driver_finish_normal8;
-    drv->d.finishNormal32 = _link_driver_finish_normal32;
+    _setup_driver_callbacks(drv, player_id);
 
     g_link_hub.gba[player_id] = gba;
     if (player_id >= g_link_hub.active_count) {
@@ -466,6 +571,7 @@ bool link_hub_attach_instance(int player_id, struct mCore* core) {
 
 void link_hub_reset(void) {
     g_link_hub.active_transfer_lines = 0;
+    g_link_hub.transfer_in_progress = false;
     for (int i = 0; i < LINK_MAX_PLAYERS; ++i) {
         if (g_link_hub.gba[i]) {
             _link_driver_reset(&g_link_hub.drivers[i].d);
@@ -475,7 +581,7 @@ void link_hub_reset(void) {
 }
 
 void link_hub_begin_frame(void) {
-    /* No-op: Lockstep em mesma thread opera de forma síncrona nos callbacks */
+    _link_hub_refresh_multi_status(&g_link_hub);
 }
 
 void link_hub_destroy(void) {
@@ -489,6 +595,9 @@ void link_hub_destroy(void) {
 }
 
 bool link_hub_is_transfer_active(void) {
+    if (g_link_hub.transfer_in_progress) {
+        return true;
+    }
     return (__atomic_load_n(&g_link_hub.active_transfer_lines, __ATOMIC_ACQUIRE) > 0);
 }
 

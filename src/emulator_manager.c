@@ -86,7 +86,7 @@ static bool load_builtin_demo_rom(struct mCore* core) {
     return true;
 }
 
-static inline void step_instance_slice(int idx, uint32_t slice_target, bool adaptive_break) {
+static inline void step_instance_slice(int idx, uint32_t slice_target) {
     struct GBA* gba = s_frame_gbas[idx];
     if (!gba || !gba->cpu) {
         return;
@@ -97,9 +97,6 @@ static inline void step_instance_slice(int idx, uint32_t slice_target, bool adap
     while (gba->video.frameCounter == start_frame &&
            (uint32_t)(mTimingCurrentTime(&gba->timing) - start_cycle) < slice_target) {
         ARMRunLoop(gba->cpu);
-        if (adaptive_break && link_hub_is_transfer_active()) {
-            break;
-        }
     }
 }
 
@@ -241,11 +238,17 @@ void emulator_step_lockstep_frame(void) {
 
     link_hub_begin_frame();
 
-    /* Adaptive lockstep for 2P-4P: 1-scanline slices during Link Cable I/O, 16-scanline slices when idle */
+    /*
+     * Lockstep de alta precisão para 2P-4P:
+     * - Durante transferências seriais ou detecção GPIO: fatias de 256 ciclos (~4x por scanline)
+     *   para que Slaves vejam o bit Busy e atualizem SIOMLT_SEND antes de _GBASIOComplete disparar.
+     * - Fora de transferências: fatias de 1 scanline (VIDEO_HORIZONTAL_LENGTH = 1232 ciclos)
+     *   evitando que um GBA entre no modo Multiplayer milhares de ciclos à frente dos demais.
+     */
     uint32_t slice_target = 0;
     while (slice_target < VIDEO_TOTAL_LENGTH) {
         bool xfer_active = link_hub_is_transfer_active();
-        uint32_t step = xfer_active ? VIDEO_HORIZONTAL_LENGTH : (VIDEO_HORIZONTAL_LENGTH * 16U);
+        uint32_t step = xfer_active ? 256U : VIDEO_HORIZONTAL_LENGTH;
         slice_target += step;
         if (slice_target > VIDEO_TOTAL_LENGTH) {
             slice_target = VIDEO_TOTAL_LENGTH;
@@ -253,20 +256,13 @@ void emulator_step_lockstep_frame(void) {
 
         for (int i = 0; i < GBA_MAX_INSTANCES; ++i) {
             if (s_frame_gbas[i]) {
-                step_instance_slice(i, slice_target, !xfer_active);
-                if (!xfer_active && link_hub_is_transfer_active()) {
-                    /* Transfer started mid-slice: resync all instances to current scanline */
-                    uint32_t elapsed = (uint32_t)(mTimingCurrentTime(&s_frame_gbas[i]->timing) - s_start_cycles[i]);
-                    uint32_t aligned = ((elapsed + VIDEO_HORIZONTAL_LENGTH - 1U) / VIDEO_HORIZONTAL_LENGTH) *
-                                       VIDEO_HORIZONTAL_LENGTH;
-                    if (aligned < slice_target) {
-                        slice_target = aligned;
-                    }
-                    xfer_active = true;
-                }
+                step_instance_slice(i, slice_target);
             }
         }
-        link_hub_notify_scanline();
+
+        if (step >= VIDEO_HORIZONTAL_LENGTH || (slice_target % VIDEO_HORIZONTAL_LENGTH) == 0U) {
+            link_hub_notify_scanline();
+        }
     }
 
     for (int i = 0; i < GBA_MAX_INSTANCES; ++i) {
