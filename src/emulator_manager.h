@@ -31,3 +31,4 @@ void emulator_step_lockstep_frame(void);
 void emulator_destroy_all(void);
 
 #endif /* EMULATOR_MANAGER_H */
+

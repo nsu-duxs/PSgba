@@ -14,6 +14,8 @@
 
 enum {
     OSD_ITEM_RESUME = 0,
+    OSD_ITEM_LINK_POWER,
+    OSD_ITEM_LINK_HOTPLUG,
     OSD_ITEM_VIDEO_RES,
     OSD_ITEM_SHOW_FPS,
     OSD_ITEM_AUDIO_FOCUS,
@@ -21,7 +23,6 @@ enum {
     OSD_ITEM_QUICK_LOAD,
     OSD_ITEM_GROUP_SAVE,
     OSD_ITEM_GROUP_LOAD,
-    OSD_ITEM_RESET_LINK,
     OSD_ITEM_RETURN_LAUNCHER,
     OSD_ITEM_COUNT
 };
@@ -288,6 +289,15 @@ void ui_menu_update_osd(struct PS4GBA_Context* ctx, uint32_t buttons_pressed) {
         s_osd_cursor = (s_osd_cursor + 1) % OSD_ITEM_COUNT;
     }
 
+    if (s_osd_cursor == OSD_ITEM_LINK_POWER &&
+        (buttons_pressed & (ORBIS_PAD_BUTTON_LEFT | ORBIS_PAD_BUTTON_RIGHT | ORBIS_PAD_BUTTON_CROSS))) {
+        bool next_state = !link_hub_is_cable_enabled();
+        link_hub_set_cable_enabled(next_state);
+        snprintf(s_osd_status, sizeof(s_osd_status),
+                 next_state ? "Link Cable LIGADO e Conectado!" : "Link Cable DESLIGADO!");
+        return;
+    }
+
     if (s_osd_cursor == OSD_ITEM_VIDEO_RES &&
         (buttons_pressed & (ORBIS_PAD_BUTTON_LEFT | ORBIS_PAD_BUTTON_RIGHT | ORBIS_PAD_BUTTON_CROSS))) {
         int delta = (buttons_pressed & ORBIS_PAD_BUTTON_LEFT) ? -1 : 1;
@@ -326,6 +336,12 @@ void ui_menu_update_osd(struct PS4GBA_Context* ctx, uint32_t buttons_pressed) {
     case OSD_ITEM_RESUME:
         s_app_state = UI_STATE_INGAME;
         break;
+    case OSD_ITEM_LINK_HOTPLUG:
+        link_hub_trigger_hotplug();
+        snprintf(s_osd_status, sizeof(s_osd_status),
+                 "Plugging Link Cable... Volte ao jogo!");
+        s_app_state = UI_STATE_INGAME;
+        break;
     case OSD_ITEM_QUICK_SAVE:
         if (save_manager_quick_save_state(ctx, s_osd_player)) {
             snprintf(s_osd_status, sizeof(s_osd_status), "State P%d salvo!", s_osd_player + 1);
@@ -354,10 +370,6 @@ void ui_menu_update_osd(struct PS4GBA_Context* ctx, uint32_t buttons_pressed) {
             snprintf(s_osd_status, sizeof(s_osd_status), "Group State nao encontrado");
         }
         break;
-    case OSD_ITEM_RESET_LINK:
-        link_hub_reset();
-        snprintf(s_osd_status, sizeof(s_osd_status), "Link Cable reiniciado!");
-        break;
     case OSD_ITEM_RETURN_LAUNCHER:
         emulator_destroy_all();
         ui_menu_scan_roms();
@@ -377,7 +389,7 @@ void ui_menu_render_launcher(uint32_t* fb) {
     draw_rect_solid(fb, 0, 0, PS4_SCREEN_WIDTH, PS4_SCREEN_HEIGHT, 0xFF10141EU);
     draw_rect_border(fb, 60, 40, PS4_SCREEN_WIDTH - 120, PS4_SCREEN_HEIGHT - 80, 3, 0xFF3A86FFU);
 
-    ui_draw_text(fb, 120, 76, "PS4 GBA 4-WAY SPLIT-SCREEN EMULATOR v1.01", 0xFFFFFFFFU, 3);
+    ui_draw_text(fb, 120, 76, "PS4 GBA 4-WAY SPLIT-SCREEN EMULATOR v1.02", 0xFFFFFFFFU, 3);
 
     static const char* const layout_labels[5] = {
         "",
@@ -452,18 +464,24 @@ void ui_menu_render_osd(uint32_t* fb, struct PS4GBA_Context* ctx) {
         return;
     }
 
-    int box_x = 380;
-    int box_y = 140;
-    int box_w = 1160;
-    int box_h = 800;
+    int box_x = 360;
+    int box_y = 120;
+    int box_w = 1200;
+    int box_h = 840;
 
     draw_rect_translucent(fb, box_x, box_y, box_w, box_h, 0x000A101AU);
     draw_rect_border(fb, box_x, box_y, box_w, box_h, 3, 0xFF00F5D4U);
 
     char buf[160];
-    snprintf(buf, sizeof(buf), "MENU OSD v1.01 - CONTROLE P%d (%s)",
+    snprintf(buf, sizeof(buf), "MENU OSD v1.02 - CONTROLE P%d (%s)",
              s_osd_player + 1, ctx ? ctx->rom_name : "");
-    ui_draw_text(fb, box_x + 50, box_y + 36, buf, 0xFFFFBE0BU, 3);
+    ui_draw_text(fb, box_x + 50, box_y + 32, buf, 0xFFFFBE0BU, 3);
+
+    char item_link_power[128];
+    const char* cable_state_str = link_hub_is_hotplugging()
+                                      ? "RECONECTANDO (HOTPLUG)..."
+                                      : (link_hub_is_cable_enabled() ? "LIGADO / CONECTADO" : "DESLIGADO");
+    snprintf(item_link_power, sizeof(item_link_power), "Estado do Link Cable: < %s >", cable_state_str);
 
     char item_res[140];
     snprintf(item_res, sizeof(item_res), "Resolucao / Qualidade: < %s >",
@@ -492,6 +510,8 @@ void ui_menu_render_osd(uint32_t* fb, struct PS4GBA_Context* ctx) {
 
     const char* items[OSD_ITEM_COUNT] = {
         "Continuar Jogo",
+        item_link_power,
+        "Conectar / Reconectar Link Cable (Simular Hotplug)",
         item_res,
         item_fps,
         item_audio,
@@ -499,14 +519,13 @@ void ui_menu_render_osd(uint32_t* fb, struct PS4GBA_Context* ctx) {
         item_qload,
         "Group Save State (4P + Link Cable)",
         "Group Load State (4P + Link Cable)",
-        "Resetar Link Cable",
         "Voltar ao Seletor de ROMs"
     };
 
     for (int i = 0; i < OSD_ITEM_COUNT; ++i) {
         bool sel = (s_osd_cursor == i);
         snprintf(buf, sizeof(buf), "%s %s", sel ? "->" : "  ", items[i]);
-        ui_draw_text(fb, box_x + 50, box_y + 104 + i * 50, buf,
+        ui_draw_text(fb, box_x + 50, box_y + 92 + i * 46, buf,
                      sel ? 0xFF00F5D4U : 0xFFE0E0E0U, 2);
     }
 
@@ -514,16 +533,16 @@ void ui_menu_render_osd(uint32_t* fb, struct PS4GBA_Context* ctx) {
     uint32_t xfer_pkts = link_hub_get_transfer_count();
     int m0 = link_hub_get_player_mode(0);
     int m1 = link_hub_get_player_mode(1);
-    const char* mode0_str = (m0 == GBA_SIO_MULTI) ? "MULTI" : (m0 == GBA_SIO_NORMAL_32) ? "NORM32" : (m0 == GBA_SIO_NORMAL_8) ? "NORM8" : "IDLE";
-    const char* mode1_str = (m1 == GBA_SIO_MULTI) ? "MULTI" : (m1 == GBA_SIO_NORMAL_32) ? "NORM32" : (m1 == GBA_SIO_NORMAL_8) ? "NORM8" : "IDLE";
+    const char* mode0_str = (m0 == GBA_SIO_MULTI) ? "MULTI" : (m0 == GBA_SIO_NORMAL_32) ? "NORM32" : (m0 == GBA_SIO_NORMAL_8) ? "NORM8" : (m0 == GBA_SIO_GPIO) ? "GPIO" : "IDLE";
+    const char* mode1_str = (m1 == GBA_SIO_MULTI) ? "MULTI" : (m1 == GBA_SIO_NORMAL_32) ? "NORM32" : (m1 == GBA_SIO_NORMAL_8) ? "NORM8" : (m1 == GBA_SIO_GPIO) ? "GPIO" : "IDLE";
 
-    char link_info[128];
-    snprintf(link_info, sizeof(link_info), "Status Link: P1 [%s]  P2 [%s]  |  Pacotes: %u",
-             mode0_str, mode1_str, xfer_pkts);
-    ui_draw_text(fb, box_x + 50, box_y + 616, link_info, 0xFF00F5D4U, 2);
+    char link_info[140];
+    snprintf(link_info, sizeof(link_info), "Status Link: P1 [%s]  P2 [%s]  |  Cabo: %s  |  Pacotes: %u",
+             mode0_str, mode1_str, link_hub_is_cable_enabled() ? "ON" : "OFF", xfer_pkts);
+    ui_draw_text(fb, box_x + 50, box_y + 620, link_info, 0xFF00F5D4U, 2);
 
     if (s_osd_status[0]) {
-        ui_draw_text(fb, box_x + 50, box_y + 665, s_osd_status, 0xFF38B000U, 2);
+        ui_draw_text(fb, box_x + 50, box_y + 668, s_osd_status, 0xFF38B000U, 2);
     }
 
     ui_draw_text(fb, box_x + 50, box_y + 720,
@@ -554,4 +573,3 @@ void ui_menu_render_fps_overlay(uint32_t* fb, int fps) {
     snprintf(fps_text, sizeof(fps_text), "FPS: %2d", fps);
     ui_draw_text(fb, badge_x + 18, badge_y + 9, fps_text, color, 2);
 }
-

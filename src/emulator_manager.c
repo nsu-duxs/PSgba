@@ -86,18 +86,57 @@ static bool load_builtin_demo_rom(struct mCore* core) {
     return true;
 }
 
-static inline void step_instance_slice(int idx, uint32_t slice_target) {
+/*
+ * Avança uma instância do GBA exatamente até `start_cycle + slice_target` usando
+ * um evento `mTimingEvent` (`lockstep_event`) que aciona `GBAInterrupt(gba)`
+ * (`gba->earlyExit = true`).
+ * Isso impede que `GBAProcessEvents` avance CPUs em `Halt` / `IntrWait` / `VBlankIntrWait`
+ * direto até o VBlank (fim do quadro), mantendo todas as 4 instâncias sincronizadas
+ * ciclo a ciclo para que as ISRs de Serial (`GBA_IRQ_SIO`) dos Escravos respondam
+ * imediatamente dentro da mesma fatia de tempo.
+ */
+static inline bool step_instance_slice(int idx, uint32_t slice_target) {
     struct GBA* gba = s_frame_gbas[idx];
     if (!gba || !gba->cpu) {
-        return;
+        return false;
     }
     uint32_t start_frame = s_start_frames[idx];
     uint32_t start_cycle = s_start_cycles[idx];
+    uint32_t target_time = start_cycle + slice_target;
+    struct mTimingEvent* lockstep_ev = &g_link_hub.drivers[idx].lockstep_event;
+    bool master_started = false;
 
-    while (gba->video.frameCounter == start_frame &&
-           (uint32_t)(mTimingCurrentTime(&gba->timing) - start_cycle) < slice_target) {
+    while (gba->video.frameCounter == start_frame) {
+        if (gba->cpu->halted) {
+            gba->cpu->cycles = 0;
+        }
+        int32_t remaining = (int32_t)(target_time - (uint32_t)mTimingCurrentTime(&gba->timing));
+        if (remaining <= 0) {
+            break;
+        }
+
+        mTimingDeschedule(&gba->timing, lockstep_ev);
+        mTimingSchedule(&gba->timing, lockstep_ev, remaining);
+
+        if (gba->cpu->halted) {
+            gba->cpu->cycles = gba->cpu->nextEvent;
+        }
+
         ARMRunLoop(gba->cpu);
+
+        if (gba->cpu->halted) {
+            gba->cpu->cycles = 0;
+            gba->cpu->nextEvent = 0;
+        }
+
+        if (idx == 0 && link_hub_consume_just_started()) {
+            master_started = true;
+            break;
+        }
     }
+
+    mTimingDeschedule(&gba->timing, lockstep_ev);
+    return master_started;
 }
 
 static inline void finish_instance_frame(int idx) {
@@ -107,11 +146,22 @@ static inline void finish_instance_frame(int idx) {
     }
     uint32_t start_frame = s_start_frames[idx];
     uint32_t start_cycle = s_start_cycles[idx];
+    struct mTimingEvent* lockstep_ev = &g_link_hub.drivers[idx].lockstep_event;
+
+    mTimingDeschedule(&gba->timing, lockstep_ev);
 
     while (gba->video.frameCounter == start_frame &&
            (uint32_t)(mTimingCurrentTime(&gba->timing) - start_cycle) <
                VIDEO_TOTAL_LENGTH + VIDEO_HORIZONTAL_LENGTH) {
+        if (gba->cpu->halted) {
+            gba->cpu->nextEvent = mTimingNextEvent(&gba->timing);
+            gba->cpu->cycles = gba->cpu->nextEvent;
+        }
         ARMRunLoop(gba->cpu);
+        if (gba->cpu->halted) {
+            gba->cpu->cycles = 0;
+            gba->cpu->nextEvent = 0;
+        }
     }
 }
 
@@ -180,7 +230,7 @@ bool emulator_init_session(const char* const rom_paths[GBA_MAX_INSTANCES], int n
                                       sizeof(g_gba_ctx.instances[i].rom_name));
         save_manager_attach_battery_save(core, g_gba_ctx.instances[i].rom_name, i);
 
-        /* Reset core BEFORE attaching Link Cable SIO driver so GBASIOReset doesn't clobber it */
+        /* Reset core ANTES de anexar o driver de SIO do Link Cable para que GBASIOReset não o sobrescreva */
         core->reset(core);
 
         g_gba_ctx.instances[i].core = core;
@@ -212,9 +262,13 @@ void emulator_step_lockstep_frame(void) {
         if (g_gba_ctx.instances[i].active && g_gba_ctx.instances[i].core &&
             g_gba_ctx.instances[i].core->board) {
             struct GBA* gba = (struct GBA*)g_gba_ctx.instances[i].core->board;
+            if (gba->cpu && gba->cpu->halted) {
+                gba->cpu->cycles = 0;
+                gba->cpu->nextEvent = 0;
+            }
             s_frame_gbas[i] = gba;
             s_start_frames[i] = gba->video.frameCounter;
-            s_start_cycles[i] = mTimingCurrentTime(&gba->timing);
+            s_start_cycles[i] = (uint32_t)mTimingCurrentTime(&gba->timing);
             if (first_active < 0) {
                 first_active = i;
             }
@@ -230,7 +284,6 @@ void emulator_step_lockstep_frame(void) {
         return;
     }
 
-    /* Fast path for 1P mode: run uninterrupted frame without scanline slicing */
     if (active_instances == 1) {
         finish_instance_frame(first_active);
         return;
@@ -238,29 +291,45 @@ void emulator_step_lockstep_frame(void) {
 
     link_hub_begin_frame();
 
-    /*
-     * Lockstep de alta precisão para 2P-4P:
-     * - Durante transferências seriais ou detecção GPIO: fatias de 256 ciclos (~4x por scanline)
-     *   para que Slaves vejam o bit Busy e atualizem SIOMLT_SEND antes de _GBASIOComplete disparar.
-     * - Fora de transferências: fatias de 1 scanline (VIDEO_HORIZONTAL_LENGTH = 1232 ciclos)
-     *   evitando que um GBA entre no modo Multiplayer milhares de ciclos à frente dos demais.
-     */
     uint32_t slice_target = 0;
     while (slice_target < VIDEO_TOTAL_LENGTH) {
         bool xfer_active = link_hub_is_transfer_active();
-        uint32_t step = xfer_active ? 256U : VIDEO_HORIZONTAL_LENGTH;
+        uint32_t step = xfer_active ? 64U : 256U;
         slice_target += step;
         if (slice_target > VIDEO_TOTAL_LENGTH) {
             slice_target = VIDEO_TOTAL_LENGTH;
         }
 
-        for (int i = 0; i < GBA_MAX_INSTANCES; ++i) {
+        if (s_frame_gbas[0]) {
+            bool master_started = step_instance_slice(0, slice_target);
+            if (master_started) {
+                /*
+                 * O Mestre (Player 0) acabou de iniciar uma transferência no ciclo `master_elapsed`.
+                 * 1. Avança todos os Escravos (Players 1..3) exatamente até `master_elapsed`.
+                 * 2. Agenda o evento de conclusão da transferência nos Escravos no ciclo exato.
+                 * 3. Conclui o restante da fatia `slice_target` para todas as instâncias.
+                 */
+                uint32_t master_elapsed =
+                    (uint32_t)(mTimingCurrentTime(&s_frame_gbas[0]->timing) - s_start_cycles[0]);
+                for (int j = 1; j < GBA_MAX_INSTANCES; ++j) {
+                    if (s_frame_gbas[j]) {
+                        step_instance_slice(j, master_elapsed);
+                    }
+                }
+                link_hub_begin_transfer_on_slaves();
+                step_instance_slice(0, slice_target);
+            }
+        }
+
+        for (int i = 1; i < GBA_MAX_INSTANCES; ++i) {
             if (s_frame_gbas[i]) {
                 step_instance_slice(i, slice_target);
             }
         }
 
-        if (step >= VIDEO_HORIZONTAL_LENGTH || (slice_target % VIDEO_HORIZONTAL_LENGTH) == 0U) {
+        link_hub_sync_pins();
+
+        if ((slice_target % VIDEO_HORIZONTAL_LENGTH) < step) {
             link_hub_notify_scanline();
         }
     }
