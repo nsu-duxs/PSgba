@@ -18,7 +18,16 @@
 #define GBA_KEY_L      (1 << 9)
 #endif
 
+/* Cores oficiais do DualShock 4 para cada jogador (P1: Azul, P2: Vermelho, P3: Verde, P4: Rosa) */
+static const OrbisPadColor s_ds4_colors[GBA_MAX_INSTANCES] = {
+    {   0, 102, 255, 255 }, /* P1: Azul */
+    { 255,  23,  68, 255 }, /* P2: Vermelho */
+    {   0, 230, 118, 255 }, /* P3: Verde */
+    { 255,  20, 147, 255 }  /* P4: Rosa */
+};
+
 static int s_pad_handles[GBA_MAX_INSTANCES] = { -1, -1, -1, -1 };
+static OrbisUserServiceUserId s_user_ids[GBA_MAX_INSTANCES] = { -1, -1, -1, -1 };
 static bool s_prev_l3_r3[GBA_MAX_INSTANCES] = { false, false, false, false };
 static uint32_t s_prev_buttons[GBA_MAX_INSTANCES] = { 0, 0, 0, 0 };
 static uint32_t s_hotplug_tick = 0;
@@ -29,17 +38,39 @@ static void refresh_pad_handles(void) {
     int ret = sceUserServiceGetLoginUserIdList(&user_list);
 
     for (int i = 0; i < GBA_MAX_INSTANCES; ++i) {
-        if (s_pad_handles[i] < 0 && ret >= 0 && user_list.userId[i] > 0) {
-            s_pad_handles[i] = scePadOpen(user_list.userId[i], ORBIS_PAD_PORT_TYPE_STANDARD, 0, NULL);
+        if (ret >= 0 && user_list.userId[i] > 0) {
+            if (s_pad_handles[i] >= 0 && s_user_ids[i] != user_list.userId[i]) {
+                scePadResetLightBar(s_pad_handles[i]);
+                scePadClose(s_pad_handles[i]);
+                s_pad_handles[i] = -1;
+            }
+            s_user_ids[i] = user_list.userId[i];
+            if (s_pad_handles[i] < 0) {
+                s_pad_handles[i] = scePadOpen(s_user_ids[i], ORBIS_PAD_PORT_TYPE_STANDARD, 0, NULL);
+                if (s_pad_handles[i] >= 0) {
+                    scePadSetLightBar(s_pad_handles[i], (OrbisPadColor*)&s_ds4_colors[i]);
+                }
+            }
         }
     }
 
     if (s_pad_handles[0] < 0) {
         OrbisUserServiceUserId initial_user = -1;
         if (sceUserServiceGetInitialUser(&initial_user) >= 0 && initial_user > 0) {
+            s_user_ids[0] = initial_user;
             s_pad_handles[0] = scePadOpen(initial_user, ORBIS_PAD_PORT_TYPE_STANDARD, 0, NULL);
+            if (s_pad_handles[0] >= 0) {
+                scePadSetLightBar(s_pad_handles[0], (OrbisPadColor*)&s_ds4_colors[0]);
+            }
         }
     }
+}
+
+OrbisUserServiceUserId input_get_user_id(int slot_index) {
+    if (slot_index < 0 || slot_index >= GBA_MAX_INSTANCES) {
+        return -1;
+    }
+    return s_user_ids[slot_index];
 }
 
 bool input_init(void) {
@@ -51,6 +82,7 @@ bool input_init(void) {
 
     for (int i = 0; i < GBA_MAX_INSTANCES; ++i) {
         s_pad_handles[i] = -1;
+        s_user_ids[i] = -1;
         s_prev_l3_r3[i] = false;
         s_prev_buttons[i] = 0;
     }
@@ -98,7 +130,7 @@ void input_poll_all(struct PS4GBA_Context* ctx) {
 
         bool l3_r3_pressed = ((b & (ORBIS_PAD_BUTTON_L3 | ORBIS_PAD_BUTTON_R3)) ==
                               (ORBIS_PAD_BUTTON_L3 | ORBIS_PAD_BUTTON_R3));
-        if (l3_r3_pressed && !s_prev_l3_r3[i]) {
+        if (l3_r3_pressed && !s_prev_l3_r3[i] && ctx->instances[i].active) {
             audio_set_mode(PS4_AUDIO_MODE_FOCUS);
             audio_set_focus_player(i);
         }
@@ -125,6 +157,14 @@ void input_poll_all(struct PS4GBA_Context* ctx) {
 
         /* UI_STATE_INGAME */
         if (newly_pressed & ORBIS_PAD_BUTTON_OPTIONS) {
+            /* Drop-In / Hot-Join: se um controle de slot inativo (P2..P4) pressionar OPTIONS, entra na partida */
+            if (!ctx->instances[i].active) {
+                refresh_pad_handles();
+                emulator_join_player(i, s_user_ids[i]);
+                continue;
+            }
+
+            /* Jogador ja ativo pressionou OPTIONS -> abre o menu OSD */
             ui_menu_open_osd(i);
             app_state = UI_STATE_OSD;
             if (ctx->instances[i].active && ctx->instances[i].core) {
@@ -179,8 +219,10 @@ void input_poll_all(struct PS4GBA_Context* ctx) {
 void input_shutdown(void) {
     for (int i = 0; i < GBA_MAX_INSTANCES; ++i) {
         if (s_pad_handles[i] >= 0) {
+            scePadResetLightBar(s_pad_handles[i]);
             scePadClose(s_pad_handles[i]);
             s_pad_handles[i] = -1;
         }
+        s_user_ids[i] = -1;
     }
 }

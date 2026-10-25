@@ -10,7 +10,7 @@
 #include <dirent.h>
 #include <orbis/Pad.h>
 
-#define LAUNCHER_ROM_START_IDX 4
+#define LAUNCHER_ROM_START_IDX 2
 
 enum {
     OSD_ITEM_RESUME = 0,
@@ -28,17 +28,14 @@ enum {
 };
 
 static UIAppState s_app_state = UI_STATE_LAUNCHER;
-static int s_num_players = 4;
-static UIRomMode s_rom_mode = UI_ROM_MODE_SHARED;
 static bool s_show_fps = true;
+static int s_join_hint_frames = 0;
 
 static char s_rom_files[UI_MAX_ROMS][UI_MAX_FILENAME];
 static char s_rom_paths[UI_MAX_ROMS][UI_MAX_PATH];
 static int s_rom_count = 0;
 
-static int s_launcher_cursor = 0; /* 0 = Players, 1 = ROM Mode, 2 = Resolution, 3 = FPS, 4+ = ROM list */
-static int s_selecting_player = 0;
-static char s_selected_roms[GBA_MAX_INSTANCES][UI_MAX_PATH];
+static int s_launcher_cursor = 0; /* 0 = Resolution, 1 = FPS, 2+ = ROM list */
 static char s_launcher_status[128] = "";
 
 static int s_osd_cursor = 0;
@@ -146,13 +143,11 @@ void ui_menu_init(void) {
     save_manager_init();
     ui_menu_scan_roms();
     s_app_state = UI_STATE_LAUNCHER;
-    s_num_players = 4;
-    s_rom_mode = UI_ROM_MODE_SHARED;
     s_launcher_cursor = LAUNCHER_ROM_START_IDX;
-    s_selecting_player = 0;
     s_osd_cursor = 0;
     s_osd_player = 0;
     s_osd_status[0] = '\0';
+    s_join_hint_frames = 0;
 }
 
 UIAppState ui_menu_get_state(void) {
@@ -182,6 +177,55 @@ void ui_menu_set_fps_visible(bool visible) {
     s_show_fps = visible;
 }
 
+void ui_menu_trigger_join_hint(void) {
+    s_join_hint_frames = 360; /* ~6 segundos a 60 FPS */
+}
+
+void ui_menu_render_join_hint(uint32_t* fb, struct PS4GBA_Context* ctx) {
+    if (!fb || s_join_hint_frames <= 0) {
+        return;
+    }
+    if (ctx && ctx->active_count >= GBA_MAX_INSTANCES) {
+        s_join_hint_frames = 0;
+        video_request_clear_framebuffers();
+        return;
+    }
+
+    s_join_hint_frames--;
+    if (s_join_hint_frames == 0) {
+        video_request_clear_framebuffers();
+        return;
+    }
+
+    /* Banner inferior: "Aperte [OPTIONS] para entrar com novo jogador" */
+    int banner_w = 780;
+    int banner_h = 44;
+    int banner_x = (PS4_SCREEN_WIDTH - banner_w) / 2;
+    int banner_y = 1010;
+
+    draw_rect_translucent(fb, banner_x, banner_y, banner_w, banner_h, 0x00080E18U);
+    draw_rect_border(fb, banner_x, banner_y, banner_w, banner_h, 2, 0xFF3A86FFU);
+
+    int cur_x = banner_x + 24;
+    int text_y = banner_y + 14;
+
+    ui_draw_text(fb, cur_x, text_y, "Aperte ", 0xFFE2E8F0U, 2);
+    cur_x += 7 * 16; /* "Aperte " = 112 px */
+
+    /* Badge visual do botao OPTIONS estilo PS4 */
+    int btn_w = 126;
+    int btn_h = 26;
+    int btn_x = cur_x;
+    int btn_y = banner_y + 9;
+
+    draw_rect_solid(fb, btn_x, btn_y, btn_w, btn_h, 0xFF1E293BU);
+    draw_rect_border(fb, btn_x, btn_y, btn_w, btn_h, 1, 0xFF00F5D4U);
+    ui_draw_text(fb, btn_x + 7, btn_y + 5, "OPTIONS", 0xFF00F5D4U, 2);
+    cur_x += btn_w + 8;
+
+    ui_draw_text(fb, cur_x, text_y, " para entrar com novo jogador", 0xFFE2E8F0U, 2);
+}
+
 void ui_menu_update_launcher(struct PS4GBA_Context* ctx, uint32_t buttons_pressed) {
     (void)ctx;
     if (buttons_pressed & ORBIS_PAD_BUTTON_TRIANGLE) {
@@ -203,73 +247,31 @@ void ui_menu_update_launcher(struct PS4GBA_Context* ctx, uint32_t buttons_presse
 
     if (s_launcher_cursor == 0) {
         if (buttons_pressed & ORBIS_PAD_BUTTON_LEFT) {
-            s_num_players = (s_num_players > 1) ? (s_num_players - 1) : 4;
-            s_selecting_player = 0;
-        }
-        if (buttons_pressed & (ORBIS_PAD_BUTTON_RIGHT | ORBIS_PAD_BUTTON_CROSS)) {
-            s_num_players = (s_num_players < 4) ? (s_num_players + 1) : 1;
-            s_selecting_player = 0;
-        }
-    } else if (s_launcher_cursor == 1) {
-        if (buttons_pressed & (ORBIS_PAD_BUTTON_LEFT | ORBIS_PAD_BUTTON_RIGHT | ORBIS_PAD_BUTTON_CROSS)) {
-            s_rom_mode = (s_rom_mode == UI_ROM_MODE_SHARED)
-                             ? UI_ROM_MODE_INDIVIDUAL
-                             : UI_ROM_MODE_SHARED;
-            s_selecting_player = 0;
-        }
-    } else if (s_launcher_cursor == 2) {
-        if (buttons_pressed & ORBIS_PAD_BUTTON_LEFT) {
             video_cycle_res_mode(-1);
         }
         if (buttons_pressed & (ORBIS_PAD_BUTTON_RIGHT | ORBIS_PAD_BUTTON_CROSS)) {
             video_cycle_res_mode(1);
         }
-    } else if (s_launcher_cursor == 3) {
+    } else if (s_launcher_cursor == 1) {
         if (buttons_pressed & (ORBIS_PAD_BUTTON_LEFT | ORBIS_PAD_BUTTON_RIGHT | ORBIS_PAD_BUTTON_CROSS)) {
             s_show_fps = !s_show_fps;
         }
     } else if (s_launcher_cursor >= LAUNCHER_ROM_START_IDX) {
-        if ((buttons_pressed & ORBIS_PAD_BUTTON_CIRCLE) &&
-            s_rom_mode == UI_ROM_MODE_INDIVIDUAL && s_selecting_player > 0) {
-            s_selecting_player--;
-        }
-
         if (buttons_pressed & ORBIS_PAD_BUTTON_CROSS) {
             int rom_idx = s_launcher_cursor - LAUNCHER_ROM_START_IDX;
             if (rom_idx >= 0 && rom_idx < s_rom_count) {
-                if (s_rom_mode == UI_ROM_MODE_SHARED) {
-                    const char* path = s_rom_paths[rom_idx];
-                    const char* paths[GBA_MAX_INSTANCES] = { path, path, path, path };
-                    bool ok = emulator_init_session(paths, s_num_players);
-                    if (ok) {
-                        s_launcher_status[0] = '\0';
-                        s_app_state = UI_STATE_INGAME;
-                    } else {
-                        ui_menu_scan_roms();
-                        snprintf(s_launcher_status, sizeof(s_launcher_status),
-                                 "Coloque arquivos .gba em /data/gba4p/roms/ ou /mnt/usb0/roms/");
-                    }
+                const char* path = s_rom_paths[rom_idx];
+                const char* paths[GBA_MAX_INSTANCES] = { path, path, path, path };
+                /* Sessao sempre inicia em Tela Cheia 1P (Controles 2..4 entram dinamicamente via OPTIONS) */
+                bool ok = emulator_init_session(paths, 1);
+                if (ok) {
+                    s_launcher_status[0] = '\0';
+                    s_app_state = UI_STATE_INGAME;
+                    ui_menu_trigger_join_hint();
                 } else {
-                    strncpy(s_selected_roms[s_selecting_player],
-                            s_rom_paths[rom_idx],
-                            sizeof(s_selected_roms[s_selecting_player]) - 1);
-                    s_selected_roms[s_selecting_player][sizeof(s_selected_roms[s_selecting_player]) - 1] = '\0';
-                    s_selecting_player++;
-                    if (s_selecting_player >= s_num_players) {
-                        const char* paths[GBA_MAX_INSTANCES] = {
-                            s_selected_roms[0], s_selected_roms[1],
-                            s_selected_roms[2], s_selected_roms[3]
-                        };
-                        s_selecting_player = 0;
-                        if (emulator_init_session(paths, s_num_players)) {
-                            s_launcher_status[0] = '\0';
-                            s_app_state = UI_STATE_INGAME;
-                        } else {
-                            ui_menu_scan_roms();
-                            snprintf(s_launcher_status, sizeof(s_launcher_status),
-                                     "Erro ao abrir ROM. Verifique /data/gba4p/roms/ ou USB");
-                        }
-                    }
+                    ui_menu_scan_roms();
+                    snprintf(s_launcher_status, sizeof(s_launcher_status),
+                             "Coloque arquivos .gba em /data/gba4p/roms/ ou /mnt/usb0/roms/");
                 }
             }
         }
@@ -373,7 +375,6 @@ void ui_menu_update_osd(struct PS4GBA_Context* ctx, uint32_t buttons_pressed) {
     case OSD_ITEM_RETURN_LAUNCHER:
         emulator_destroy_all();
         ui_menu_scan_roms();
-        s_selecting_player = 0;
         s_app_state = UI_STATE_LAUNCHER;
         break;
     default:
@@ -389,53 +390,26 @@ void ui_menu_render_launcher(uint32_t* fb) {
     draw_rect_solid(fb, 0, 0, PS4_SCREEN_WIDTH, PS4_SCREEN_HEIGHT, 0xFF10141EU);
     draw_rect_border(fb, 60, 40, PS4_SCREEN_WIDTH - 120, PS4_SCREEN_HEIGHT - 80, 3, 0xFF3A86FFU);
 
-    ui_draw_text(fb, 120, 76, "PS4 GBA 4-WAY SPLIT-SCREEN EMULATOR v1.02", 0xFFFFFFFFU, 3);
-
-    static const char* const layout_labels[5] = {
-        "",
-        "1P (Tela Unica HD 1620x1080 / 1920x1080)",
-        "2P (Split Side-by-Side HD 960x640 / 960x720)",
-        "3P (Quadrantes 2x2 HD 804x532 / 960x540)",
-        "4P (Quadrantes 2x2 HD 804x532 / 960x540)"
-    };
+    ui_draw_text(fb, 120, 76, "PS4 GBA 4-WAY SPLIT-SCREEN EMULATOR v1.03", 0xFFFFFFFFU, 3);
 
     char line_buf[256];
-    snprintf(line_buf, sizeof(line_buf), "%s Jogadores Ativos: < %s >",
-             (s_launcher_cursor == 0) ? ">" : " ", layout_labels[s_num_players]);
+    snprintf(line_buf, sizeof(line_buf), "%s Resolucao / Qualidade: < %s >",
+             (s_launcher_cursor == 0) ? ">" : " ",
+             video_get_res_mode_name(video_get_res_mode()));
     ui_draw_text(fb, 120, 142, line_buf,
                  (s_launcher_cursor == 0) ? 0xFF00F5D4U : 0xFFCCCCCCU, 2);
 
-    snprintf(line_buf, sizeof(line_buf), "%s Modo de ROM: < %s >",
+    snprintf(line_buf, sizeof(line_buf), "%s Mostrar Contador de FPS: < %s >",
              (s_launcher_cursor == 1) ? ">" : " ",
-             (s_rom_mode == UI_ROM_MODE_SHARED)
-                 ? "Mesma ROM para todos"
-                 : "ROM individual por jogador");
-    ui_draw_text(fb, 120, 178, line_buf,
+             s_show_fps ? "Ligado (Canto Superior)" : "Desligado");
+    ui_draw_text(fb, 120, 180, line_buf,
                  (s_launcher_cursor == 1) ? 0xFF00F5D4U : 0xFFCCCCCCU, 2);
 
-    snprintf(line_buf, sizeof(line_buf), "%s Resolucao / Qualidade: < %s >",
-             (s_launcher_cursor == 2) ? ">" : " ",
-             video_get_res_mode_name(video_get_res_mode()));
-    ui_draw_text(fb, 120, 214, line_buf,
-                 (s_launcher_cursor == 2) ? 0xFF00F5D4U : 0xFFCCCCCCU, 2);
+    snprintf(line_buf, sizeof(line_buf),
+             "ROMS disponiveis (%d encontradas - [TRIANGULO] Atualizar):", s_rom_count);
+    ui_draw_text(fb, 120, 234, line_buf, 0xFFFFBE0BU, 2);
 
-    snprintf(line_buf, sizeof(line_buf), "%s Mostrar Contador de FPS: < %s >",
-             (s_launcher_cursor == 3) ? ">" : " ",
-             s_show_fps ? "Ligado (Canto Superior)" : "Desligado");
-    ui_draw_text(fb, 120, 250, line_buf,
-                 (s_launcher_cursor == 3) ? 0xFF00F5D4U : 0xFFCCCCCCU, 2);
-
-    if (s_rom_mode == UI_ROM_MODE_INDIVIDUAL) {
-        snprintf(line_buf, sizeof(line_buf),
-                 "Selecione a ROM para o JOGADOR %d de %d (/data/gba4p/roms/ ou USB):",
-                 s_selecting_player + 1, s_num_players);
-    } else {
-        snprintf(line_buf, sizeof(line_buf),
-                 "ROMS disponiveis (%d encontradas - [TRIANGULO] Atualizar):", s_rom_count);
-    }
-    ui_draw_text(fb, 120, 300, line_buf, 0xFFFFBE0BU, 2);
-
-    int max_visible = 15;
+    int max_visible = 16;
     int selected_rom = (s_launcher_cursor >= LAUNCHER_ROM_START_IDX)
                            ? (s_launcher_cursor - LAUNCHER_ROM_START_IDX)
                            : 0;
@@ -446,7 +420,7 @@ void ui_menu_render_launcher(uint32_t* fb) {
         bool is_sel = (s_launcher_cursor == idx + LAUNCHER_ROM_START_IDX);
         snprintf(line_buf, sizeof(line_buf), "%s [%02d] %s",
                  is_sel ? "->" : "  ", idx + 1, s_rom_files[idx]);
-        ui_draw_text(fb, 140, 344 + i * 36, line_buf,
+        ui_draw_text(fb, 140, 276 + i * 36, line_buf,
                      is_sel ? 0xFFFFFFFFU : 0xFF99A3B8U, 2);
     }
 
@@ -455,7 +429,7 @@ void ui_menu_render_launcher(uint32_t* fb) {
     }
 
     ui_draw_text(fb, 120, 960,
-                 "[X] Confirmar   [D-PAD] Navegar   [OPTIONS] Menu In-Game   [L3+R3] Foco Audio",
+                 "[X] Iniciar 1P   [TRIANGULO] Atualizar ROMs   [OPTIONS] Menu OSD",
                  0xFF708090U, 2);
 }
 
@@ -473,7 +447,7 @@ void ui_menu_render_osd(uint32_t* fb, struct PS4GBA_Context* ctx) {
     draw_rect_border(fb, box_x, box_y, box_w, box_h, 3, 0xFF00F5D4U);
 
     char buf[160];
-    snprintf(buf, sizeof(buf), "MENU OSD v1.02 - CONTROLE P%d (%s)",
+    snprintf(buf, sizeof(buf), "MENU OSD v1.03 - CONTROLE P%d (%s)",
              s_osd_player + 1, ctx ? ctx->rom_name : "");
     ui_draw_text(fb, box_x + 50, box_y + 32, buf, 0xFFFFBE0BU, 3);
 
@@ -546,7 +520,8 @@ void ui_menu_render_osd(uint32_t* fb, struct PS4GBA_Context* ctx) {
     }
 
     ui_draw_text(fb, box_x + 50, box_y + 720,
-                 "[X / SETAS] Selecionar/Alterar   [CIRCLE/OPTIONS] Fechar OSD", 0xFF8899AAU, 2);
+                 "[X / SETAS] Selecionar   [OPTIONS no Controle 2/3/4] Entrar no Jogo   [CIRCLE] Fechar",
+                 0xFF8899AAU, 2);
 }
 
 void ui_menu_render_fps_overlay(uint32_t* fb, int fps) {

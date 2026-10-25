@@ -403,6 +403,11 @@ static inline void blit_6x_wc64(
     }
 }
 
+/*
+ * Borda interna (inset) fina e nitida contornando o viewport ativo de cada jogador.
+ * Ao desenhar dentro dos limites [x, x+w) e [y, y+h), nenhuma borda e cortada,
+ * mesmo em resolucao cheia 1080p ou nas extremidades da tela.
+ */
 static void draw_viewport_border(
     uint32_t* fb,
     int x,
@@ -412,40 +417,47 @@ static void draw_viewport_border(
     int thickness,
     uint32_t color
 ) {
-    for (int t = 0; t < thickness; ++t) {
-        int top_y = y - thickness + t;
-        int bot_y = y + h + t;
-        int left_x = x - thickness;
-        int span_w = w + thickness * 2;
-
-        if (top_y >= 0 && top_y < PS4_SCREEN_HEIGHT) {
-            for (int px = left_x; px < left_x + span_w; ++px) {
-                if (px >= 0 && px < PS4_SCREEN_WIDTH) {
-                    fb[top_y * PS4_SCREEN_WIDTH + px] = color;
-                }
-            }
-        }
-        if (bot_y >= 0 && bot_y < PS4_SCREEN_HEIGHT) {
-            for (int px = left_x; px < left_x + span_w; ++px) {
-                if (px >= 0 && px < PS4_SCREEN_WIDTH) {
-                    fb[bot_y * PS4_SCREEN_WIDTH + px] = color;
-                }
-            }
-        }
+    if (!fb || w <= 0 || h <= 0 || thickness <= 0) {
+        return;
+    }
+    if (thickness * 2 > w) {
+        thickness = w / 2;
+    }
+    if (thickness * 2 > h) {
+        thickness = h / 2;
     }
 
-    for (int py = y; py < y + h; ++py) {
-        if (py < 0 || py >= PS4_SCREEN_HEIGHT) {
-            continue;
-        }
-        for (int t = 0; t < thickness; ++t) {
-            int lx = x - thickness + t;
-            int rx = x + w + t;
-            if (lx >= 0 && lx < PS4_SCREEN_WIDTH) {
-                fb[py * PS4_SCREEN_WIDTH + lx] = color;
+    for (int t = 0; t < thickness; ++t) {
+        int y_top = y + t;
+        int y_bot = y + h - 1 - t;
+        int x_left = x + t;
+        int x_right = x + w - 1 - t;
+
+        int x_start = (x >= 0) ? x : 0;
+        int x_end = (x + w <= PS4_SCREEN_WIDTH) ? (x + w) : PS4_SCREEN_WIDTH;
+        int y_start = (y >= 0) ? y : 0;
+        int y_end = (y + h <= PS4_SCREEN_HEIGHT) ? (y + h) : PS4_SCREEN_HEIGHT;
+
+        if (y_top >= 0 && y_top < PS4_SCREEN_HEIGHT) {
+            uint32_t* row = &fb[y_top * PS4_SCREEN_WIDTH];
+            for (int px = x_start; px < x_end; ++px) {
+                row[px] = color;
             }
-            if (rx >= 0 && rx < PS4_SCREEN_WIDTH) {
-                fb[py * PS4_SCREEN_WIDTH + rx] = color;
+        }
+        if (y_bot >= 0 && y_bot < PS4_SCREEN_HEIGHT && y_bot != y_top) {
+            uint32_t* row = &fb[y_bot * PS4_SCREEN_WIDTH];
+            for (int px = x_start; px < x_end; ++px) {
+                row[px] = color;
+            }
+        }
+        if (x_left >= 0 && x_left < PS4_SCREEN_WIDTH) {
+            for (int py = y_start; py < y_end; ++py) {
+                fb[py * PS4_SCREEN_WIDTH + x_left] = color;
+            }
+        }
+        if (x_right >= 0 && x_right < PS4_SCREEN_WIDTH && x_right != x_left) {
+            for (int py = y_start; py < y_end; ++py) {
+                fb[py * PS4_SCREEN_WIDTH + x_right] = color;
             }
         }
     }
@@ -626,6 +638,10 @@ static void update_fps_counter(void) {
     }
 }
 
+void video_request_clear_framebuffers(void) {
+    s_clear_frames_remaining = NUM_FRAMEBUFFERS;
+}
+
 void video_render_split_screen(struct PS4GBA_Context* ctx) {
     uint32_t* back_buffer = (uint32_t*)s_framebuffers[s_buffer_index];
     if (!back_buffer) {
@@ -680,26 +696,30 @@ void video_render_split_screen(struct PS4GBA_Context* ctx) {
         }
     }
 
+    /* Cores correspondentes aos 4 controles DualShock 4 (P1: Azul, P2: Vermelho, P3: Verde, P4: Rosa) */
     static const uint32_t player_colors[GBA_MAX_INSTANCES] = {
-        0xFF00F5D4U, /* P1: Cyan   */
-        0xFFFFBE0BU, /* P2: Gold   */
-        0xFFFF006EU, /* P3: Pink   */
-        0xFF38B000U  /* P4: Green  */
+        0xFF0066FFU, /* P1: Azul (Controle 1) */
+        0xFFFF1744U, /* P2: Vermelho (Controle 2) */
+        0xFF00E676U, /* P3: Verde (Controle 3) */
+        0xFFFF1493U  /* P4: Rosa (Controle 4) */
     };
 
     if (s_res_mode == PS4_RES_1X_NATIVE) {
         if (active_count == 1) {
             if (ctx->instances[0].active && ctx->instances[0].video_buffer) {
                 blit_6x_wc64(back_buffer, ctx->instances[0].video_buffer, 240, 60);
+                int border_thick = (focus_highlight && audio_focus == 0) ? 4 : 2;
+                draw_viewport_border(back_buffer, 240, 60, 1440, 960, border_thick, player_colors[0]);
             }
         } else if (active_count == 2) {
             static const int p2_x[2] = { 0, 960 };
-            for (int i = 0; i < 2; ++i) {
+            int view_idx = 0;
+            for (int i = 0; i < GBA_MAX_INSTANCES && view_idx < 2; ++i) {
                 if (ctx->instances[i].active && ctx->instances[i].video_buffer) {
-                    blit_4x_wc64(back_buffer, ctx->instances[i].video_buffer, p2_x[i], 220);
-                    if (focus_highlight && audio_focus == i) {
-                        draw_viewport_border(back_buffer, p2_x[i], 220, 960, 640, 3, player_colors[i]);
-                    }
+                    blit_4x_wc64(back_buffer, ctx->instances[i].video_buffer, p2_x[view_idx], 220);
+                    int border_thick = (focus_highlight && audio_focus == i) ? 4 : 2;
+                    draw_viewport_border(back_buffer, p2_x[view_idx], 220, 960, 640, border_thick, player_colors[i]);
+                    view_idx++;
                 }
             }
         } else {
@@ -716,11 +736,10 @@ void video_render_split_screen(struct PS4GBA_Context* ctx) {
                 if (ctx && ctx->instances[i].active && ctx->instances[i].video_buffer) {
                     blit_3x_wc64(back_buffer, ctx->instances[i].video_buffer,
                                  quadrant_origins[i].x, quadrant_origins[i].y);
-                    if (focus_highlight && audio_focus == i) {
-                        draw_viewport_border(back_buffer,
-                                             quadrant_origins[i].x, quadrant_origins[i].y,
-                                             720, 480, 3, player_colors[i]);
-                    }
+                    int border_thick = (focus_highlight && audio_focus == i) ? 4 : 2;
+                    draw_viewport_border(back_buffer,
+                                         quadrant_origins[i].x, quadrant_origins[i].y,
+                                         720, 480, border_thick, player_colors[i]);
                 }
             }
         }
@@ -736,6 +755,8 @@ void video_render_split_screen(struct PS4GBA_Context* ctx) {
             if (ctx->instances[0].active && ctx->instances[0].video_buffer) {
                 render_instance_hd(back_buffer, ctx->instances[0].video_buffer,
                                    internal_scale, dst_x, 0, dst_w, dst_h);
+                int border_thick = (focus_highlight && audio_focus == 0) ? 4 : 2;
+                draw_viewport_border(back_buffer, dst_x, 0, dst_w, dst_h, border_thick, player_colors[0]);
             }
         } else if (active_count == 2) {
             /* 2P: 4x Ultra HD (960x640 internal) -> 960x640 (3:2) or 960x720 (16:9) */
@@ -744,13 +765,14 @@ void video_render_split_screen(struct PS4GBA_Context* ctx) {
             int dst_h = full_16_9 ? 720 : 640;
             int dst_y = (PS4_SCREEN_HEIGHT - dst_h) / 2;
             static const int p2_x[2] = { 0, 960 };
-            for (int i = 0; i < 2; ++i) {
+            int view_idx = 0;
+            for (int i = 0; i < GBA_MAX_INSTANCES && view_idx < 2; ++i) {
                 if (ctx->instances[i].active && ctx->instances[i].video_buffer) {
                     render_instance_hd(back_buffer, ctx->instances[i].video_buffer,
-                                       internal_scale, p2_x[i], dst_y, dst_w, dst_h);
-                    if (focus_highlight && audio_focus == i) {
-                        draw_viewport_border(back_buffer, p2_x[i], dst_y, dst_w, dst_h, 3, player_colors[i]);
-                    }
+                                       internal_scale, p2_x[view_idx], dst_y, dst_w, dst_h);
+                    int border_thick = (focus_highlight && audio_focus == i) ? 4 : 2;
+                    draw_viewport_border(back_buffer, p2_x[view_idx], dst_y, dst_w, dst_h, border_thick, player_colors[i]);
+                    view_idx++;
                 }
             }
         } else {
@@ -771,11 +793,10 @@ void video_render_split_screen(struct PS4GBA_Context* ctx) {
                 if (ctx && ctx->instances[i].active && ctx->instances[i].video_buffer) {
                     render_instance_hd(back_buffer, ctx->instances[i].video_buffer,
                                        internal_scale, quad_x[i], quad_y[i], dst_w, dst_h);
-                    if (focus_highlight && audio_focus == i) {
-                        draw_viewport_border(back_buffer,
-                                             quad_x[i], quad_y[i],
-                                             dst_w, dst_h, 3, player_colors[i]);
-                    }
+                    int border_thick = (focus_highlight && audio_focus == i) ? 4 : 2;
+                    draw_viewport_border(back_buffer,
+                                         quad_x[i], quad_y[i],
+                                         dst_w, dst_h, border_thick, player_colors[i]);
                 }
             }
         }
@@ -783,6 +804,10 @@ void video_render_split_screen(struct PS4GBA_Context* ctx) {
 
     if (show_fps) {
         ui_menu_render_fps_overlay(back_buffer, s_current_fps);
+    }
+
+    if (ui_state == UI_STATE_INGAME && !osd_open) {
+        ui_menu_render_join_hint(back_buffer, ctx);
     }
 
     if (osd_open) {

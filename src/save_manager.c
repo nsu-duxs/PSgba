@@ -3,9 +3,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <mgba-util/vfs.h>
+#include <mgba/internal/gba/gba.h>
+#include <mgba/internal/gba/savedata.h>
 
 #define GROUP_STATE_MAGIC 0x34534750U /* 'PGS4' */
 
@@ -21,10 +24,78 @@ typedef struct PS4GroupStateHeader {
     uint16_t sio_siocnt[LINK_MAX_PLAYERS];
 } PS4GroupStateHeader;
 
+static bool is_registered_ps4_user(OrbisUserServiceUserId user_id) {
+    if (user_id <= 0 || user_id == ORBIS_USER_SERVICE_USER_ID_SYSTEM) {
+        return false;
+    }
+
+    char user_name[ORBIS_USER_SERVICE_MAX_USER_NAME_LENGTH + 1];
+    memset(user_name, 0, sizeof(user_name));
+    if (sceUserServiceGetUserName(user_id, user_name, sizeof(user_name)) < 0 ||
+        user_name[0] == '\0') {
+        return false;
+    }
+
+    if (strncasecmp(user_name, "Guest", 5) == 0 ||
+        strncasecmp(user_name, "Convidado", 9) == 0) {
+        return false;
+    }
+
+    return true;
+}
+
+static void build_user_save_path(const char* rom_name, int player_id,
+                                 OrbisUserServiceUserId user_id,
+                                 char* out_path, size_t max_len) {
+    mkdir(PS4_DATA_ROOT_DIR, 0777);
+    mkdir(PS4_SAVES_DIR, 0777);
+    mkdir(PS4_GUEST_SAVES_DIR, 0777);
+
+    char profile_dir[256];
+    if (is_registered_ps4_user(user_id)) {
+        snprintf(profile_dir, sizeof(profile_dir),
+                 "%s/user_%08x", PS4_SAVES_DIR, (unsigned int)user_id);
+        mkdir(profile_dir, 0777);
+    } else {
+        int slot_num = (player_id >= 0 && player_id < GBA_MAX_INSTANCES) ? (player_id + 1) : 1;
+        snprintf(profile_dir, sizeof(profile_dir),
+                 "%s/guest_%d", PS4_GUEST_SAVES_DIR, slot_num);
+        mkdir(profile_dir, 0777);
+    }
+
+    snprintf(out_path, max_len, "%s/%s.sav", profile_dir, rom_name);
+}
+
+static void build_user_state_path(const char* rom_name, int player_id,
+                                  OrbisUserServiceUserId user_id,
+                                  char* out_path, size_t max_len) {
+    mkdir(PS4_DATA_ROOT_DIR, 0777);
+    mkdir(PS4_STATES_DIR, 0777);
+
+    char profile_dir[256];
+    if (is_registered_ps4_user(user_id)) {
+        snprintf(profile_dir, sizeof(profile_dir),
+                 "%s/user_%08x", PS4_STATES_DIR, (unsigned int)user_id);
+        mkdir(profile_dir, 0777);
+    } else {
+        char guests_state_root[256];
+        snprintf(guests_state_root, sizeof(guests_state_root), "%s/guests", PS4_STATES_DIR);
+        mkdir(guests_state_root, 0777);
+
+        int slot_num = (player_id >= 0 && player_id < GBA_MAX_INSTANCES) ? (player_id + 1) : 1;
+        snprintf(profile_dir, sizeof(profile_dir),
+                 "%s/guest_%d", guests_state_root, slot_num);
+        mkdir(profile_dir, 0777);
+    }
+
+    snprintf(out_path, max_len, "%s/%s.ss0", profile_dir, rom_name);
+}
+
 bool save_manager_init(void) {
     mkdir(PS4_DATA_ROOT_DIR, 0777);
     mkdir(PS4_ROMS_DIR, 0777);
     mkdir(PS4_SAVES_DIR, 0777);
+    mkdir(PS4_GUEST_SAVES_DIR, 0777);
     mkdir(PS4_STATES_DIR, 0777);
     return true;
 }
@@ -61,14 +132,14 @@ void save_manager_extract_rom_name(const char* rom_path, char* out_name, size_t 
     out_name[len] = '\0';
 }
 
-bool save_manager_attach_battery_save(struct mCore* core, const char* rom_name, int player_id) {
+bool save_manager_attach_battery_save(struct mCore* core, const char* rom_name, int player_id,
+                                      OrbisUserServiceUserId user_id) {
     if (!core || !rom_name || player_id < 0 || player_id >= GBA_MAX_INSTANCES) {
         return false;
     }
 
     char save_path[256];
-    snprintf(save_path, sizeof(save_path),
-             "%s/%s_P%d.sav", PS4_SAVES_DIR, rom_name, player_id + 1);
+    build_user_save_path(rom_name, player_id, user_id, save_path, sizeof(save_path));
 
     struct VFile* vf = VFileOpen(save_path, O_CREAT | O_RDWR);
     if (!vf) {
@@ -76,6 +147,24 @@ bool save_manager_attach_battery_save(struct mCore* core, const char* rom_name, 
     }
 
     return core->loadSave(core, vf);
+}
+
+void save_manager_flush_battery_save(struct mCore* core) {
+    if (!core || !core->board) {
+        return;
+    }
+
+    struct GBA* gba = (struct GBA*)core->board;
+    struct GBASavedata* savedata = &gba->memory.savedata;
+    if (!savedata->vf || !savedata->data) {
+        return;
+    }
+
+    GBASavedataClean(savedata, 0);
+    size_t size = GBASavedataSize(savedata);
+    if (size > 0) {
+        savedata->vf->sync(savedata->vf, savedata->data, size);
+    }
 }
 
 bool save_manager_quick_save_state(struct PS4GBA_Context* ctx, int player_id) {
@@ -87,6 +176,8 @@ bool save_manager_quick_save_state(struct PS4GBA_Context* ctx, int player_id) {
     if (!ctx->instances[player_id].active || !core) {
         return false;
     }
+
+    save_manager_flush_battery_save(core);
 
     size_t state_size = core->stateSize(core);
     if (state_size == 0) {
@@ -107,8 +198,8 @@ bool save_manager_quick_save_state(struct PS4GBA_Context* ctx, int player_id) {
                             ? ctx->instances[player_id].rom_name
                             : ctx->rom_name;
     char state_path[256];
-    snprintf(state_path, sizeof(state_path),
-             "%s/%s_P%d.ss0", PS4_STATES_DIR, rname, player_id + 1);
+    build_user_state_path(rname, player_id, ctx->instances[player_id].user_id,
+                          state_path, sizeof(state_path));
 
     struct VFile* vf = VFileOpen(state_path, O_CREAT | O_TRUNC | O_RDWR);
     if (!vf) {
@@ -142,8 +233,8 @@ bool save_manager_quick_load_state(struct PS4GBA_Context* ctx, int player_id) {
                             ? ctx->instances[player_id].rom_name
                             : ctx->rom_name;
     char state_path[256];
-    snprintf(state_path, sizeof(state_path),
-             "%s/%s_P%d.ss0", PS4_STATES_DIR, rname, player_id + 1);
+    build_user_state_path(rname, player_id, ctx->instances[player_id].user_id,
+                          state_path, sizeof(state_path));
 
     struct VFile* vf = VFileOpen(state_path, O_RDONLY);
     if (!vf) {
@@ -227,10 +318,13 @@ bool save_manager_group_save_state(struct PS4GBA_Context* ctx) {
         struct mCore* core = ctx->instances[i].core;
         if (!ctx->instances[i].active || !core) {
             memset(state_buf, 0, state_size);
-        } else if (!core->saveState(core, state_buf)) {
-            vf->close(vf);
-            free(state_buf);
-            return false;
+        } else {
+            save_manager_flush_battery_save(core);
+            if (!core->saveState(core, state_buf)) {
+                vf->close(vf);
+                free(state_buf);
+                return false;
+            }
         }
 
         if (vf->write(vf, state_buf, state_size) != (ssize_t)state_size) {
@@ -312,4 +406,3 @@ bool save_manager_group_load_state(struct PS4GBA_Context* ctx) {
 
     return true;
 }
-

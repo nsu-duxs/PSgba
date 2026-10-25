@@ -23,6 +23,7 @@ PS4VideoResMode video_get_res_mode(void);
 void video_cycle_res_mode(int delta);
 const char* video_get_res_mode_name(PS4VideoResMode mode);
 void video_render_split_screen(struct PS4GBA_Context* ctx);
+void video_request_clear_framebuffers(void);
 void video_shutdown(void);
 
 #endif /* VIDEO_SPLIT_H */

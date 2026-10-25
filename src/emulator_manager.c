@@ -2,6 +2,7 @@
 #include "link_cable_hub.h"
 #include "audio_ps4.h"
 #include "save_manager.h"
+#include "input_ds4.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -86,6 +87,69 @@ static bool load_builtin_demo_rom(struct mCore* core) {
     return true;
 }
 
+static bool instantiate_player_slot(int slot_index, const char* path, OrbisUserServiceUserId user_id) {
+    if (slot_index < 0 || slot_index >= GBA_MAX_INSTANCES || !path || !*path) {
+        return false;
+    }
+
+    if (g_gba_ctx.instances[slot_index].active && g_gba_ctx.instances[slot_index].core) {
+        return true;
+    }
+
+    struct mCore* core = GBACoreCreate();
+    if (!core) {
+        return false;
+    }
+
+    if (!core->init(core)) {
+        core->deinit(core);
+        return false;
+    }
+
+    mCoreInitConfig(core, NULL);
+    core->opts.skipBios = true;
+    core->opts.useBios = false;
+    core->opts.volume = 0x100;
+    core->opts.mute = false;
+
+    uint32_t* vbuf = (uint32_t*)calloc(GBA_SCREEN_WIDTH * GBA_SCREEN_HEIGHT, sizeof(uint32_t));
+    if (!vbuf) {
+        mCoreConfigDeinit(&core->config);
+        core->deinit(core);
+        return false;
+    }
+
+    core->setVideoBuffer(core, (mColor*)vbuf, GBA_SCREEN_WIDTH);
+    core->setAudioBufferSize(core, GBA_AUDIO_BUFFER_SIZE);
+
+    bool rom_loaded = mCoreLoadFile(core, path);
+    if (!rom_loaded && strstr(path, "test.gba") != NULL) {
+        rom_loaded = load_builtin_demo_rom(core);
+    }
+
+    if (!rom_loaded) {
+        free(vbuf);
+        mCoreConfigDeinit(&core->config);
+        core->deinit(core);
+        return false;
+    }
+
+    save_manager_extract_rom_name(path, g_gba_ctx.instances[slot_index].rom_name,
+                                  sizeof(g_gba_ctx.instances[slot_index].rom_name));
+    save_manager_attach_battery_save(core, g_gba_ctx.instances[slot_index].rom_name,
+                                     slot_index, user_id);
+
+    /* Reset core ANTES de anexar o driver de SIO do Link Cable para que GBASIOReset não o sobrescreva */
+    core->reset(core);
+
+    g_gba_ctx.instances[slot_index].core = core;
+    g_gba_ctx.instances[slot_index].video_buffer = vbuf;
+    g_gba_ctx.instances[slot_index].user_id = user_id;
+    g_gba_ctx.instances[slot_index].active = true;
+    g_gba_ctx.active_count++;
+    return true;
+}
+
 /*
  * Avança uma instância do GBA exatamente até `start_cycle + slice_target` usando
  * um evento `mTimingEvent` (`lockstep_event`) que aciona `GBAInterrupt(gba)`
@@ -166,77 +230,31 @@ static inline void finish_instance_frame(int idx) {
 }
 
 bool emulator_init_session(const char* const rom_paths[GBA_MAX_INSTANCES], int num_players) {
-    if (!rom_paths || num_players < 1 || num_players > GBA_MAX_INSTANCES) {
+    if (!rom_paths || !rom_paths[0] || !*rom_paths[0] ||
+        num_players < 1 || num_players > GBA_MAX_INSTANCES) {
         return false;
     }
 
     mLogSetDefaultLogger(&s_silent_logger);
     emulator_destroy_all();
     memset(&g_gba_ctx, 0, sizeof(g_gba_ctx));
+    for (int i = 0; i < GBA_MAX_INSTANCES; ++i) {
+        g_gba_ctx.instances[i].user_id = -1;
+    }
+
     save_manager_init();
+    strncpy(g_gba_ctx.rom_path, rom_paths[0], sizeof(g_gba_ctx.rom_path) - 1);
+    g_gba_ctx.rom_path[sizeof(g_gba_ctx.rom_path) - 1] = '\0';
     save_manager_extract_rom_name(rom_paths[0], g_gba_ctx.rom_name, sizeof(g_gba_ctx.rom_name));
     link_hub_init();
 
     for (int i = 0; i < num_players; ++i) {
         const char* path = rom_paths[i] ? rom_paths[i] : rom_paths[0];
-        if (!path || !*path) {
+        OrbisUserServiceUserId uid = input_get_user_id(i);
+        if (!instantiate_player_slot(i, path, uid)) {
             emulator_destroy_all();
             return false;
         }
-
-        struct mCore* core = GBACoreCreate();
-        if (!core) {
-            emulator_destroy_all();
-            return false;
-        }
-
-        if (!core->init(core)) {
-            core->deinit(core);
-            emulator_destroy_all();
-            return false;
-        }
-
-        mCoreInitConfig(core, NULL);
-        core->opts.skipBios = true;
-        core->opts.useBios = false;
-        core->opts.volume = 0x100;
-        core->opts.mute = false;
-
-        uint32_t* vbuf = (uint32_t*)calloc(GBA_SCREEN_WIDTH * GBA_SCREEN_HEIGHT, sizeof(uint32_t));
-        if (!vbuf) {
-            mCoreConfigDeinit(&core->config);
-            core->deinit(core);
-            emulator_destroy_all();
-            return false;
-        }
-
-        core->setVideoBuffer(core, (mColor*)vbuf, GBA_SCREEN_WIDTH);
-        core->setAudioBufferSize(core, GBA_AUDIO_BUFFER_SIZE);
-
-        bool rom_loaded = mCoreLoadFile(core, path);
-        if (!rom_loaded && strstr(path, "test.gba") != NULL) {
-            rom_loaded = load_builtin_demo_rom(core);
-        }
-
-        if (!rom_loaded) {
-            free(vbuf);
-            mCoreConfigDeinit(&core->config);
-            core->deinit(core);
-            emulator_destroy_all();
-            return false;
-        }
-
-        save_manager_extract_rom_name(path, g_gba_ctx.instances[i].rom_name,
-                                      sizeof(g_gba_ctx.instances[i].rom_name));
-        save_manager_attach_battery_save(core, g_gba_ctx.instances[i].rom_name, i);
-
-        /* Reset core ANTES de anexar o driver de SIO do Link Cable para que GBASIOReset não o sobrescreva */
-        core->reset(core);
-
-        g_gba_ctx.instances[i].core = core;
-        g_gba_ctx.instances[i].video_buffer = vbuf;
-        g_gba_ctx.instances[i].active = true;
-        g_gba_ctx.active_count++;
     }
 
     struct mCore* active_cores[GBA_MAX_INSTANCES];
@@ -252,7 +270,26 @@ bool emulator_init_all(const char* rom_path) {
     const char* paths[GBA_MAX_INSTANCES] = {
         rom_path, rom_path, rom_path, rom_path
     };
-    return emulator_init_session(paths, GBA_MAX_INSTANCES);
+    return emulator_init_session(paths, 1);
+}
+
+bool emulator_join_player(int slot_index, OrbisUserServiceUserId user_id) {
+    if (slot_index < 0 || slot_index >= GBA_MAX_INSTANCES) {
+        return false;
+    }
+    if (g_gba_ctx.instances[slot_index].active) {
+        return true;
+    }
+    if (g_gba_ctx.rom_path[0] == '\0') {
+        return false;
+    }
+
+    if (!instantiate_player_slot(slot_index, g_gba_ctx.rom_path, user_id)) {
+        return false;
+    }
+
+    link_hub_attach_instance(slot_index, g_gba_ctx.instances[slot_index].core);
+    return true;
 }
 
 void emulator_step_lockstep_frame(void) {
@@ -347,6 +384,7 @@ void emulator_destroy_all(void) {
     for (int i = 0; i < GBA_MAX_INSTANCES; ++i) {
         if (g_gba_ctx.instances[i].core) {
             struct mCore* core = g_gba_ctx.instances[i].core;
+            save_manager_flush_battery_save(core);
             g_gba_ctx.instances[i].core = NULL;
             mCoreConfigDeinit(&core->config);
             core->deinit(core);
@@ -356,6 +394,7 @@ void emulator_destroy_all(void) {
             g_gba_ctx.instances[i].video_buffer = NULL;
         }
         g_gba_ctx.instances[i].active = false;
+        g_gba_ctx.instances[i].user_id = -1;
     }
     g_gba_ctx.active_count = 0;
 }
