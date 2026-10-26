@@ -4,10 +4,13 @@
 #include "audio_ps4.h"
 #include "save_manager.h"
 #include "link_cable_hub.h"
+#include "ps4_jailbreak.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include <dirent.h>
+#include <sys/stat.h>
 #include <orbis/Pad.h>
 
 #define LAUNCHER_ROM_START_IDX 2
@@ -34,6 +37,8 @@ static int s_join_hint_frames = 0;
 static char s_rom_files[UI_MAX_ROMS][UI_MAX_FILENAME];
 static char s_rom_paths[UI_MAX_ROMS][UI_MAX_PATH];
 static int s_rom_count = 0;
+static int s_usb_rom_count = 0;
+static char s_usb_status_str[128] = "USB: Verificando portas /mnt/usb0..7...";
 
 static int s_launcher_cursor = 0; /* 0 = Resolution, 1 = FPS, 2+ = ROM list */
 static char s_launcher_status[128] = "";
@@ -86,50 +91,218 @@ static bool has_gba_extension(const char* name) {
     if (!dot) {
         return false;
     }
-    return (strcasecmp(dot, ".gba") == 0);
+    return (strcasecmp(dot, ".gba") == 0 ||
+            strcasecmp(dot, ".agb") == 0 ||
+            strcasecmp(dot, ".bin") == 0 ||
+            strcasecmp(dot, ".zip") == 0 ||
+            strcasecmp(dot, ".7z") == 0);
 }
 
-static void scan_rom_directory(const char* dir_path) {
+static bool is_system_or_junk_dir(const char* name) {
+    if (!name || name[0] == '.') {
+        return true; /* Ignora '.', '..' e arquivos/pastas ocultas */
+    }
+    if (strcasecmp(name, "$RECYCLE.BIN") == 0 ||
+        strcasecmp(name, "System Volume Information") == 0 ||
+        strcasecmp(name, "LOST.DIR") == 0 ||
+        strcasecmp(name, "Android") == 0 ||
+        strcasecmp(name, ".Spotlight-V100") == 0 ||
+        strcasecmp(name, ".Trashes") == 0 ||
+        strcasecmp(name, ".fseventsd") == 0) {
+        return true;
+    }
+    return false;
+}
+
+static void scan_directory_recursive(const char* dir_path, int depth) {
+    if (!dir_path || depth > 5 || s_rom_count >= UI_MAX_ROMS) {
+        return;
+    }
+
     DIR* dir = opendir(dir_path);
     if (!dir) {
         return;
     }
 
+    size_t dlen = strlen(dir_path);
+    bool has_trailing_slash = (dlen > 0 && dir_path[dlen - 1] == '/');
+
     struct dirent* entry;
     while ((entry = readdir(dir)) != NULL && s_rom_count < UI_MAX_ROMS) {
-        if (entry->d_name[0] == '.') {
+        if (!entry->d_name[0] || entry->d_name[0] == '.') {
             continue;
         }
+
+        char full_path[UI_MAX_PATH];
+        int len;
+        if (has_trailing_slash) {
+            len = snprintf(full_path, sizeof(full_path), "%s%s", dir_path, entry->d_name);
+        } else {
+            len = snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, entry->d_name);
+        }
+        if (len <= 0 || len >= (int)sizeof(full_path)) {
+            continue;
+        }
+
+        /* Determina se e diretorio para busca recursiva */
+        bool is_dir = false;
+        if (entry->d_type == DT_DIR) {
+            is_dir = true;
+        } else if (entry->d_type == DT_UNKNOWN || entry->d_type == DT_LNK) {
+            /* Tenta opendir para deteccao fiavel de subpastas em exFAT/FAT32 sem depender de stat */
+            DIR* sub = opendir(full_path);
+            if (sub) {
+                is_dir = true;
+                closedir(sub);
+            }
+        }
+
+        if (is_dir) {
+            if (!is_system_or_junk_dir(entry->d_name)) {
+                scan_directory_recursive(full_path, depth + 1);
+            }
+            continue;
+        }
+
+        /* E um arquivo: verifica se possui extensao compativel */
         if (has_gba_extension(entry->d_name)) {
-            snprintf(s_rom_paths[s_rom_count], UI_MAX_PATH, "%s/%s", dir_path, entry->d_name);
-            strncpy(s_rom_files[s_rom_count], entry->d_name, UI_MAX_FILENAME - 1);
-            s_rom_files[s_rom_count][UI_MAX_FILENAME - 1] = '\0';
-            s_rom_count++;
+            /* Evita duplicatas se o mesmo caminho for percorrido */
+            bool duplicate = false;
+            for (int i = 0; i < s_rom_count; ++i) {
+                if (strcmp(s_rom_paths[i], full_path) == 0) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (!duplicate) {
+                strncpy(s_rom_paths[s_rom_count], full_path, UI_MAX_PATH - 1);
+                s_rom_paths[s_rom_count][UI_MAX_PATH - 1] = '\0';
+
+                /* Rotula ROMs originarias do pendrive com [USB] para clareza visual */
+                if (strncmp(full_path, "/mnt/usb", 8) == 0 ||
+                    strncmp(full_path, "/usb", 4) == 0 ||
+                    strncmp(full_path, "/mnt/ext", 8) == 0) {
+                    snprintf(s_rom_files[s_rom_count], UI_MAX_FILENAME, "[USB] %s", entry->d_name);
+                } else {
+                    strncpy(s_rom_files[s_rom_count], entry->d_name, UI_MAX_FILENAME - 1);
+                }
+                s_rom_files[s_rom_count][UI_MAX_FILENAME - 1] = '\0';
+                s_rom_count++;
+            }
         }
     }
     closedir(dir);
 }
 
+static void sort_rom_list(void) {
+    for (int i = 0; i < s_rom_count - 1; ++i) {
+        for (int j = i + 1; j < s_rom_count; ++j) {
+            if (strcasecmp(s_rom_files[i], s_rom_files[j]) > 0) {
+                char tmp_f[UI_MAX_FILENAME];
+                char tmp_p[UI_MAX_PATH];
+
+                memcpy(tmp_f, s_rom_files[i], sizeof(tmp_f));
+                memcpy(tmp_p, s_rom_paths[i], sizeof(tmp_p));
+
+                memcpy(s_rom_files[i], s_rom_files[j], sizeof(tmp_f));
+                memcpy(s_rom_paths[i], s_rom_paths[j], sizeof(tmp_p));
+
+                memcpy(s_rom_files[j], tmp_f, sizeof(tmp_f));
+                memcpy(s_rom_paths[j], tmp_p, sizeof(tmp_p));
+            }
+        }
+    }
+}
+
 void ui_menu_scan_roms(void) {
+    ps4_jailbreak_system();
     s_rom_count = 0;
     memset(s_rom_files, 0, sizeof(s_rom_files));
     memset(s_rom_paths, 0, sizeof(s_rom_paths));
 
-    static const char* const k_search_dirs[] = {
-        PS4_ROMS_DIR,
-        "/data/roms",
-        "/mnt/usb0/gba4p/roms",
-        "/mnt/usb0/roms",
-        "/mnt/usb0",
-        "/mnt/usb1/gba4p/roms",
-        "/mnt/usb1/roms",
-        "/mnt/usb1"
-    };
+    /* 1. Diretorios internos do PS4 */
+    scan_directory_recursive(PS4_ROMS_DIR, 0);
+    scan_directory_recursive("/data/roms", 0);
+    scan_directory_recursive("/data/gba", 0);
+    scan_directory_recursive("/data/homebrew/roms", 0);
+    scan_directory_recursive("/data/homebrew/gba", 0);
 
-    for (size_t i = 0; i < sizeof(k_search_dirs) / sizeof(k_search_dirs[0]); ++i) {
-        if (s_rom_count < UI_MAX_ROMS) {
-            scan_rom_directory(k_search_dirs[i]);
+    int ps4_roms = s_rom_count;
+    char active_usb_ports[64] = "";
+    int usb_ports_found = 0;
+
+    /* 2. Todas as portas USB montadas pelo PS4 Orbis OS (/mnt/usb0 ate /mnt/usb7) */
+    for (int u = 0; u < 8 && s_rom_count < UI_MAX_ROMS; ++u) {
+        char usb_path[32];
+        bool mounted = false;
+
+        /* Teste 1: /mnt/usbX */
+        snprintf(usb_path, sizeof(usb_path), "/mnt/usb%d", u);
+        DIR* test = opendir(usb_path);
+        if (test) {
+            closedir(test);
+            mounted = true;
+        } else {
+            /* Teste 2: /mnt/usbX/ */
+            snprintf(usb_path, sizeof(usb_path), "/mnt/usb%d/", u);
+            test = opendir(usb_path);
+            if (test) {
+                closedir(test);
+                mounted = true;
+            } else {
+                /* Teste 3: Fallback raiz /usbX */
+                snprintf(usb_path, sizeof(usb_path), "/usb%d", u);
+                test = opendir(usb_path);
+                if (test) {
+                    closedir(test);
+                    mounted = true;
+                }
+            }
         }
+
+        if (mounted) {
+            if (usb_ports_found == 0) {
+                snprintf(active_usb_ports, sizeof(active_usb_ports), "/mnt/usb%d", u);
+            }
+            usb_ports_found++;
+            scan_directory_recursive(usb_path, 0);
+        }
+    }
+
+    /* 3. Disco externo USB (/mnt/ext0) se configurado */
+    DIR* ext = opendir("/mnt/ext0");
+    if (!ext) {
+        ext = opendir("/mnt/ext0/");
+    }
+    if (ext) {
+        closedir(ext);
+        if (usb_ports_found == 0) {
+            snprintf(active_usb_ports, sizeof(active_usb_ports), "/mnt/ext0");
+        }
+        usb_ports_found++;
+        scan_directory_recursive("/mnt/ext0", 0);
+    }
+
+    s_usb_rom_count = s_rom_count - ps4_roms;
+
+    if (usb_ports_found > 0) {
+        if (s_usb_rom_count > 0) {
+            snprintf(s_usb_status_str, sizeof(s_usb_status_str),
+                     "USB: %s conectado (%d ROMs USB detectadas)",
+                     active_usb_ports, s_usb_rom_count);
+        } else {
+            snprintf(s_usb_status_str, sizeof(s_usb_status_str),
+                     "USB: %s montado, mas 0 ROMs (.gba/.zip) na raiz ou subpastas",
+                     active_usb_ports);
+        }
+    } else {
+        snprintf(s_usb_status_str, sizeof(s_usb_status_str),
+                 "USB: Nenhum pendrive detectado em /mnt/usb0..7 (Formate FAT32/exFAT)");
+    }
+
+    /* Ordena a lista alfabeticamente para facil navegacao */
+    if (s_rom_count > 1) {
+        sort_rom_list();
     }
 
     if (s_rom_count == 0) {
@@ -228,11 +401,46 @@ void ui_menu_render_join_hint(uint32_t* fb, struct PS4GBA_Context* ctx) {
 
 void ui_menu_update_launcher(struct PS4GBA_Context* ctx, uint32_t buttons_pressed) {
     (void)ctx;
+
+    /* Deteccao automatica periodica de insercao/remocao de pendrive a cada ~1s (60 frames) */
+    static uint32_t s_usb_poll_tick = 0;
+    static uint32_t s_last_usb_mask = 0xFFFFFFFFU;
+    if ((++s_usb_poll_tick % 60U) == 0U) {
+        uint32_t cur_mask = 0;
+        for (int u = 0; u < 8; ++u) {
+            char u_path[32];
+            snprintf(u_path, sizeof(u_path), "/mnt/usb%d", u);
+            DIR* d = opendir(u_path);
+            if (!d) {
+                snprintf(u_path, sizeof(u_path), "/mnt/usb%d/", u);
+                d = opendir(u_path);
+            }
+            if (d) {
+                cur_mask |= (1U << u);
+                closedir(d);
+            }
+        }
+        DIR* dext = opendir("/mnt/ext0");
+        if (dext) {
+            cur_mask |= (1U << 8);
+            closedir(dext);
+        }
+        if (s_last_usb_mask == 0xFFFFFFFFU) {
+            s_last_usb_mask = cur_mask;
+        } else if (cur_mask != s_last_usb_mask) {
+            s_last_usb_mask = cur_mask;
+            ui_menu_scan_roms();
+            snprintf(s_launcher_status, sizeof(s_launcher_status),
+                     "Alteracao no USB detectada: %d ROM(s) encontradas", s_rom_count);
+        }
+    }
+
     if (buttons_pressed & ORBIS_PAD_BUTTON_TRIANGLE) {
         ui_menu_scan_roms();
         s_launcher_cursor = LAUNCHER_ROM_START_IDX;
         snprintf(s_launcher_status, sizeof(s_launcher_status),
-                 "Lista de ROMs atualizada (/data/gba4p/roms e /mnt/usb0)");
+                 "Varredura concluida: %d ROM(s) (%d USB, %d PS4 interno)",
+                 s_rom_count, s_usb_rom_count, s_rom_count - s_usb_rom_count);
         return;
     }
 
@@ -271,7 +479,7 @@ void ui_menu_update_launcher(struct PS4GBA_Context* ctx, uint32_t buttons_presse
                 } else {
                     ui_menu_scan_roms();
                     snprintf(s_launcher_status, sizeof(s_launcher_status),
-                             "Coloque arquivos .gba em /data/gba4p/roms/ ou /mnt/usb0/roms/");
+                             "Erro ao carregar ROM. Verifique os arquivos no Pendrive ou PS4");
                 }
             }
         }
@@ -390,7 +598,7 @@ void ui_menu_render_launcher(uint32_t* fb) {
     draw_rect_solid(fb, 0, 0, PS4_SCREEN_WIDTH, PS4_SCREEN_HEIGHT, 0xFF10141EU);
     draw_rect_border(fb, 60, 40, PS4_SCREEN_WIDTH - 120, PS4_SCREEN_HEIGHT - 80, 3, 0xFF3A86FFU);
 
-    ui_draw_text(fb, 120, 76, "PS4 GBA 4-WAY SPLIT-SCREEN EMULATOR v1.03", 0xFFFFFFFFU, 3);
+    ui_draw_text(fb, 120, 76, "PS4 GBA 4-WAY SPLIT-SCREEN EMULATOR v1.04", 0xFFFFFFFFU, 3);
 
     char line_buf[256];
     snprintf(line_buf, sizeof(line_buf), "%s Resolucao / Qualidade: < %s >",
@@ -406,7 +614,7 @@ void ui_menu_render_launcher(uint32_t* fb) {
                  (s_launcher_cursor == 1) ? 0xFF00F5D4U : 0xFFCCCCCCU, 2);
 
     snprintf(line_buf, sizeof(line_buf),
-             "ROMS disponiveis (%d encontradas - [TRIANGULO] Atualizar):", s_rom_count);
+             "ROMS disponiveis (%d encontradas - [TRIANGULO] Recarregar USB):", s_rom_count);
     ui_draw_text(fb, 120, 234, line_buf, 0xFFFFBE0BU, 2);
 
     int max_visible = 16;
@@ -418,18 +626,25 @@ void ui_menu_render_launcher(uint32_t* fb) {
     for (int i = 0; i < max_visible && (start_idx + i) < s_rom_count; ++i) {
         int idx = start_idx + i;
         bool is_sel = (s_launcher_cursor == idx + LAUNCHER_ROM_START_IDX);
+        bool is_usb = (strncmp(s_rom_files[idx], "[USB]", 5) == 0);
+
         snprintf(line_buf, sizeof(line_buf), "%s [%02d] %s",
                  is_sel ? "->" : "  ", idx + 1, s_rom_files[idx]);
-        ui_draw_text(fb, 140, 276 + i * 36, line_buf,
-                     is_sel ? 0xFFFFFFFFU : 0xFF99A3B8U, 2);
+
+        uint32_t text_color = is_sel ? 0xFF00F5D4U : (is_usb ? 0xFF64DFDFU : 0xFFCBD5E1U);
+        ui_draw_text(fb, 140, 276 + i * 36, line_buf, text_color, 2);
     }
 
+    /* Informacoes de status do USB e varredura */
+    uint32_t usb_color = (s_usb_rom_count > 0) ? 0xFF00F5D4U : 0xFFFFBE0BU;
+    ui_draw_text(fb, 120, 874, s_usb_status_str, usb_color, 2);
+
     if (s_launcher_status[0]) {
-        ui_draw_text(fb, 120, 910, s_launcher_status, 0xFFFF595EU, 2);
+        ui_draw_text(fb, 120, 914, s_launcher_status, 0xFFFF595EU, 2);
     }
 
     ui_draw_text(fb, 120, 960,
-                 "[X] Iniciar 1P   [TRIANGULO] Atualizar ROMs   [OPTIONS] Menu OSD",
+                 "[X] Iniciar 1P   [TRIANGULO] Forçar Varredura USB   [OPTIONS] Menu OSD",
                  0xFF708090U, 2);
 }
 
@@ -447,7 +662,7 @@ void ui_menu_render_osd(uint32_t* fb, struct PS4GBA_Context* ctx) {
     draw_rect_border(fb, box_x, box_y, box_w, box_h, 3, 0xFF00F5D4U);
 
     char buf[160];
-    snprintf(buf, sizeof(buf), "MENU OSD v1.03 - CONTROLE P%d (%s)",
+    snprintf(buf, sizeof(buf), "MENU OSD v1.04 - CONTROLE P%d (%s)",
              s_osd_player + 1, ctx ? ctx->rom_name : "");
     ui_draw_text(fb, box_x + 50, box_y + 32, buf, 0xFFFFBE0BU, 3);
 

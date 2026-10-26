@@ -141,6 +141,38 @@ bool save_manager_attach_battery_save(struct mCore* core, const char* rom_name, 
     char save_path[256];
     build_user_save_path(rom_name, player_id, user_id, save_path, sizeof(save_path));
 
+    /*
+     * Se o save ainda nao existe no PS4, verifica se ha um .sav pre-existente no Pendrive
+     * ao lado da ROM para importar (ex: save trazido do PC). Apos importado, todas as
+     * leituras e gravacoes permanecem estritamente no armazenamento interno do PS4.
+     */
+    struct stat st;
+    if (stat(save_path, &st) != 0 || st.st_size == 0) {
+        if (g_gba_ctx.rom_path[0] != '\0') {
+            char usb_sav_path[256];
+            strncpy(usb_sav_path, g_gba_ctx.rom_path, sizeof(usb_sav_path) - 1);
+            usb_sav_path[sizeof(usb_sav_path) - 1] = '\0';
+            char* dot = strrchr(usb_sav_path, '.');
+            if (dot) {
+                *dot = '\0';
+                strncat(usb_sav_path, ".sav", sizeof(usb_sav_path) - strlen(usb_sav_path) - 1);
+                FILE* src_f = fopen(usb_sav_path, "rb");
+                if (src_f) {
+                    FILE* dst_f = fopen(save_path, "wb");
+                    if (dst_f) {
+                        char buf[4096];
+                        size_t n;
+                        while ((n = fread(buf, 1, sizeof(buf), src_f)) > 0) {
+                            fwrite(buf, 1, n, dst_f);
+                        }
+                        fclose(dst_f);
+                    }
+                    fclose(src_f);
+                }
+            }
+        }
+    }
+
     struct VFile* vf = VFileOpen(save_path, O_CREAT | O_RDWR);
     if (!vf) {
         return false;

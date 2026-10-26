@@ -12,6 +12,7 @@
 #include "input_ds4.h"
 #include "audio_ps4.h"
 #include "ui_menu.h"
+#include "ps4_jailbreak.h"
 
 /* ============================================================================
  * 1. Overrides de funcoes da libc (musl) que acessam %fs:[0] (TLS) ou ENOSYS
@@ -317,6 +318,7 @@ void* realloc(void* ptr, size_t size) {
 }
 
 int main(int argc, char* argv[]) {
+    ps4_jailbreak_system();
     (void)argc;
     (void)argv;
 

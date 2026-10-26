@@ -5,7 +5,7 @@
 #include <stdbool.h>
 #include "emulator_manager.h"
 
-#define UI_MAX_ROMS      128
+#define UI_MAX_ROMS      512
 #define UI_MAX_FILENAME  128
 #define UI_MAX_PATH      256
 

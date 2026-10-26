@@ -63,7 +63,7 @@ file(WRITE "${CMAKE_BINARY_DIR}/mgba_gen/mgba/core/version.h" "
 #define GIT_REV 1
 #define BINARY_NAME \"mgba-ps4\"
 #define PROJECT_NAME \"mGBA PS4 4P\"
-#define PROJECT_VERSION \"1.01\"
+#define PROJECT_VERSION \"1.04\"
 #endif
 ")
 
@@ -157,7 +157,7 @@ target_compile_definitions(mgba_core PUBLIC
     HAVE_LOCALTIME_R
     binaryName="mgba-ps4"
     projectName="mGBA PS4 4P"
-    projectVersion="1.01"
+    projectVersion="1.04"
     gitCommit="ps4-split"
     gitCommitShort="ps4"
     gitBranch="main"
@@ -167,14 +167,20 @@ target_compile_definitions(mgba_core PUBLIC
 # ==============================================================================
 # 3. EXECUTÁVEL DO EMULADOR PS4 (4-Way Split Screen + Link Cable Hub)
 # ==============================================================================
-file(GLOB PS4_APP_SRCS "${CMAKE_CURRENT_SOURCE_DIR}/src/*.c")
+file(GLOB PS4_APP_SRCS
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/*.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/libjbc/*.c"
+)
 
 # Invoca ld.lld diretamente (padrão oficial OpenOrbis) para não injetar PT_INTERP/PT_NOTE de Linux
 set(CMAKE_C_LINK_EXECUTABLE "ld.lld <LINK_FLAGS> <OBJECTS> -o <TARGET> <LINK_LIBRARIES>")
 
 add_executable(${PROJECT_NAME}.elf ${PS4_APP_SRCS})
 
-target_include_directories(${PROJECT_NAME}.elf PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_include_directories(${PROJECT_NAME}.elf PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/libjbc"
+)
 
 # Linkagem com as bibliotecas do sistema Orbis OS e libc da OpenOrbis
 target_link_options(${PROJECT_NAME}.elf PRIVATE
