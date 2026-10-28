@@ -188,18 +188,6 @@ static inline bool step_instance_slice(int idx, uint32_t slice_target) {
     struct mTimingEvent* lockstep_ev = &g_link_hub.drivers[idx].lockstep_event;
     bool master_started = false;
 
-    if (gba->cpu->halted) {
-        gba->cpu->cycles = 0;
-    }
-
-    int32_t init_rem = (int32_t)(target_time - (uint32_t)mTimingCurrentTime(&gba->timing));
-    if (init_rem <= 0) {
-        return false;
-    }
-
-    mTimingDeschedule(&gba->timing, lockstep_ev);
-    mTimingSchedule(&gba->timing, lockstep_ev, init_rem);
-
     while (gba->video.frameCounter == start_frame) {
         if (gba->cpu->halted) {
             gba->cpu->cycles = 0;
@@ -209,9 +197,8 @@ static inline bool step_instance_slice(int idx, uint32_t slice_target) {
             break;
         }
 
-        if (!mTimingIsScheduled(&gba->timing, lockstep_ev)) {
-            mTimingSchedule(&gba->timing, lockstep_ev, remaining);
-        }
+        mTimingDeschedule(&gba->timing, lockstep_ev);
+        mTimingSchedule(&gba->timing, lockstep_ev, remaining);
 
         if (gba->cpu->halted) {
             gba->cpu->nextEvent = mTimingNextEvent(&gba->timing);
@@ -222,7 +209,7 @@ static inline bool step_instance_slice(int idx, uint32_t slice_target) {
 
         if (gba->cpu->halted) {
             gba->cpu->cycles = 0;
-            gba->cpu->nextEvent = 0;
+            gba->cpu->nextEvent = mTimingNextEvent(&gba->timing);
         }
 
         if (idx == 0 && link_hub_consume_just_started()) {
@@ -235,6 +222,7 @@ static inline bool step_instance_slice(int idx, uint32_t slice_target) {
     }
 
     mTimingDeschedule(&gba->timing, lockstep_ev);
+    gba->cpu->nextEvent = mTimingNextEvent(&gba->timing);
     return master_started;
 }
 
@@ -248,6 +236,7 @@ static inline void finish_instance_frame(int idx) {
     struct mTimingEvent* lockstep_ev = &g_link_hub.drivers[idx].lockstep_event;
 
     mTimingDeschedule(&gba->timing, lockstep_ev);
+    gba->cpu->nextEvent = mTimingNextEvent(&gba->timing);
 
     while (gba->video.frameCounter == start_frame &&
            (uint32_t)(mTimingCurrentTime(&gba->timing) - start_cycle) <
@@ -259,7 +248,7 @@ static inline void finish_instance_frame(int idx) {
         ARMRunLoop(gba->cpu);
         if (gba->cpu->halted) {
             gba->cpu->cycles = 0;
-            gba->cpu->nextEvent = 0;
+            gba->cpu->nextEvent = mTimingNextEvent(&gba->timing);
         }
     }
 }
@@ -466,15 +455,18 @@ bool emulator_join_player(int slot_index, OrbisUserServiceUserId user_id) {
 }
 
 void emulator_step_lockstep_frame(void) {
+    bool skip_render = video_begin_frame_should_skip_render();
     int active_instances = 0;
     int first_active = -1;
     for (int i = 0; i < GBA_MAX_INSTANCES; ++i) {
         if (g_gba_ctx.instances[i].active && g_gba_ctx.instances[i].core &&
             g_gba_ctx.instances[i].core->board) {
             struct GBA* gba = (struct GBA*)g_gba_ctx.instances[i].core->board;
+            gba->video.frameskip = 0;
+            gba->video.frameskipCounter = skip_render ? 1 : 0;
             if (gba->cpu && gba->cpu->halted) {
                 gba->cpu->cycles = 0;
-                gba->cpu->nextEvent = 0;
+                gba->cpu->nextEvent = mTimingNextEvent(&gba->timing);
             }
             s_frame_gbas[i] = gba;
             s_start_frames[i] = gba->video.frameCounter;
@@ -506,49 +498,86 @@ void emulator_step_lockstep_frame(void) {
     uint32_t slice_target = 0;
     while (slice_target < VIDEO_TOTAL_LENGTH) {
         bool xfer_active = link_hub_is_transfer_active();
-        uint32_t step = xfer_active ? VIDEO_HORIZONTAL_LENGTH : 4096U;
+        uint32_t prev_target = slice_target;
+        uint32_t step = xfer_active ? 64U : 256U;
         slice_target += step;
+        if (g_link_hub.transfer_in_progress &&
+            g_link_hub.transfer_finish_elapsed > prev_target &&
+            g_link_hub.transfer_finish_elapsed < slice_target) {
+            slice_target = g_link_hub.transfer_finish_elapsed;
+        }
         if (slice_target > VIDEO_TOTAL_LENGTH) {
             slice_target = VIDEO_TOTAL_LENGTH;
         }
 
         __atomic_store_n(&g_link_hub.slice_interrupt, false, __ATOMIC_RELEASE);
 
-        /* Dispara os Escravos (Players 1..3 nos Cores 1..3) ANTES de avançar o Mestre (Player 0 no Core 0),
-         * garantindo execução 100% simultânea em paralelo nos 4 núcleos Jaguar! */
-        dispatch_slaves_slice(slice_target);
-        bool master_started = false;
-        if (s_frame_gbas[0]) {
-            master_started = step_instance_slice(0, slice_target);
-        }
-        wait_slaves_done();
-
-        if (master_started && s_frame_gbas[0]) {
-            uint32_t master_elapsed =
-                (uint32_t)(mTimingCurrentTime(&s_frame_gbas[0]->timing) - s_start_cycles[0]);
-            __atomic_store_n(&g_link_hub.slice_interrupt, false, __ATOMIC_RELEASE);
-            dispatch_slaves_slice(master_elapsed);
-            wait_slaves_done();
-
-            link_hub_begin_transfer_on_slaves(master_elapsed, s_start_cycles);
-
-            if (g_link_hub.transfer_finish_elapsed > master_elapsed &&
-                g_link_hub.transfer_finish_elapsed < slice_target) {
-                slice_target = g_link_hub.transfer_finish_elapsed;
-            }
-
-            __atomic_store_n(&g_link_hub.slice_interrupt, false, __ATOMIC_RELEASE);
-            dispatch_slaves_slice(slice_target);
-            step_instance_slice(0, slice_target);
-            wait_slaves_done();
-        } else if (__atomic_load_n(&g_link_hub.slice_interrupt, __ATOMIC_ACQUIRE)) {
-            link_hub_sync_pins();
-            __atomic_store_n(&g_link_hub.slice_interrupt, false, __ATOMIC_RELEASE);
-            dispatch_slaves_slice(slice_target);
+        if (xfer_active) {
+            /* Durante transferência ativa do Link Cable, avança o Mestre (Player 0) primeiro na
+             * microfatia de 64 ciclos para que os Escravos nunca ultrapassem `master_elapsed`. */
+            bool master_started = false;
             if (s_frame_gbas[0]) {
+                master_started = step_instance_slice(0, slice_target);
+            }
+            if (master_started && s_frame_gbas[0]) {
+                uint32_t master_elapsed =
+                    (uint32_t)(mTimingCurrentTime(&s_frame_gbas[0]->timing) - s_start_cycles[0]);
+                __atomic_store_n(&g_link_hub.slice_interrupt, false, __ATOMIC_RELEASE);
+                dispatch_slaves_slice(master_elapsed);
+                wait_slaves_done();
+
+                link_hub_begin_transfer_on_slaves(master_elapsed, s_start_cycles);
+
+                if (g_link_hub.transfer_finish_elapsed > master_elapsed &&
+                    g_link_hub.transfer_finish_elapsed < slice_target) {
+                    slice_target = g_link_hub.transfer_finish_elapsed;
+                }
+
+                __atomic_store_n(&g_link_hub.slice_interrupt, false, __ATOMIC_RELEASE);
+                dispatch_slaves_slice(slice_target);
                 step_instance_slice(0, slice_target);
+                wait_slaves_done();
+            } else {
+                __atomic_store_n(&g_link_hub.slice_interrupt, false, __ATOMIC_RELEASE);
+                dispatch_slaves_slice(slice_target);
+                wait_slaves_done();
+            }
+        } else {
+            /* Fora de transferência ativa, dispara todos os 4 núcleos Jaguar simultaneamente em paralelo! */
+            dispatch_slaves_slice(slice_target);
+            bool master_started = false;
+            if (s_frame_gbas[0]) {
+                master_started = step_instance_slice(0, slice_target);
             }
             wait_slaves_done();
+
+            if (master_started && s_frame_gbas[0]) {
+                uint32_t master_elapsed =
+                    (uint32_t)(mTimingCurrentTime(&s_frame_gbas[0]->timing) - s_start_cycles[0]);
+                __atomic_store_n(&g_link_hub.slice_interrupt, false, __ATOMIC_RELEASE);
+                dispatch_slaves_slice(master_elapsed);
+                wait_slaves_done();
+
+                link_hub_begin_transfer_on_slaves(master_elapsed, s_start_cycles);
+
+                if (g_link_hub.transfer_finish_elapsed > master_elapsed &&
+                    g_link_hub.transfer_finish_elapsed < slice_target) {
+                    slice_target = g_link_hub.transfer_finish_elapsed;
+                }
+
+                __atomic_store_n(&g_link_hub.slice_interrupt, false, __ATOMIC_RELEASE);
+                dispatch_slaves_slice(slice_target);
+                step_instance_slice(0, slice_target);
+                wait_slaves_done();
+            } else if (__atomic_load_n(&g_link_hub.slice_interrupt, __ATOMIC_ACQUIRE)) {
+                link_hub_sync_pins();
+                __atomic_store_n(&g_link_hub.slice_interrupt, false, __ATOMIC_RELEASE);
+                dispatch_slaves_slice(slice_target);
+                if (s_frame_gbas[0]) {
+                    step_instance_slice(0, slice_target);
+                }
+                wait_slaves_done();
+            }
         }
 
         if (g_link_hub.transfer_in_progress &&
@@ -559,7 +588,7 @@ void emulator_step_lockstep_frame(void) {
 
         link_hub_sync_pins();
 
-        if ((slice_target % VIDEO_HORIZONTAL_LENGTH) < step) {
+        if ((slice_target % VIDEO_HORIZONTAL_LENGTH) < (slice_target - prev_target)) {
             link_hub_notify_scanline();
         }
     }

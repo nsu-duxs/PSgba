@@ -31,6 +31,8 @@ static UIAppState s_prev_ui_state = UI_STATE_LAUNCHER;
 static PS4VideoResMode s_res_mode = PS4_RES_AUTO_HD;
 static PS4VideoResMode s_prev_res_mode = PS4_RES_AUTO_HD;
 static PS4FpsLimit s_fps_limit = PS4_FPS_60;
+static bool s_skip_frame_render = false;
+static uint64_t s_frame_deadline_us = 0;
 static int s_fps_frame_count = 0;
 static uint64_t s_fps_last_us = 0;
 static int s_current_fps = 60;
@@ -673,12 +675,15 @@ bool video_init(void) {
         return false;
     }
 
-    /* Flip rate: 0 = 60Hz, 1 = 30Hz */
-    sceVideoOutSetFlipRate(s_video_handle, (s_fps_limit == PS4_FPS_30) ? 1 : 0);
+    /* Mantém o hardware de vídeo em 60Hz constante; o modo 30 FPS faz frameskip 1 de vídeo
+     * mantendo a emulação da CPU do GBA e o áudio em 60Hz (100% da velocidade real). */
+    sceVideoOutSetFlipRate(s_video_handle, 0);
 
     s_buffer_index = 0;
     s_flip_arg = 1;
     s_submitted_flip_arg = 0;
+    s_skip_frame_render = false;
+    s_frame_deadline_us = 0;
     s_clear_frames_remaining = NUM_FRAMEBUFFERS;
     return true;
 }
@@ -686,9 +691,12 @@ bool video_init(void) {
 void video_set_fps_limit(PS4FpsLimit limit) {
     if (limit >= 0 && limit < PS4_FPS_LIMIT_COUNT) {
         s_fps_limit = limit;
+        s_skip_frame_render = false;
+        s_fps_last_us = 0;
+        s_fps_frame_count = 0;
+        s_current_fps = (limit == PS4_FPS_30) ? 30 : 60;
         if (s_video_handle >= 0) {
-            /* 0 = 60Hz, 1 = 30Hz */
-            sceVideoOutSetFlipRate(s_video_handle, (limit == PS4_FPS_30) ? 1 : 0);
+            sceVideoOutSetFlipRate(s_video_handle, 0);
         }
         s_clear_frames_remaining = NUM_FRAMEBUFFERS;
     }
@@ -704,6 +712,17 @@ void video_toggle_fps_limit(void) {
 
 const char* video_get_fps_limit_name(PS4FpsLimit limit) {
     return (limit == PS4_FPS_30) ? "30 FPS" : "60 FPS";
+}
+
+bool video_begin_frame_should_skip_render(void) {
+    if (s_fps_limit == PS4_FPS_30 &&
+        ui_menu_get_state() == UI_STATE_INGAME &&
+        !ui_menu_is_osd_open()) {
+        s_skip_frame_render = !s_skip_frame_render;
+    } else {
+        s_skip_frame_render = false;
+    }
+    return s_skip_frame_render;
 }
 
 void video_set_res_mode(PS4VideoResMode mode) {
@@ -863,24 +882,50 @@ void video_render_instance_slot(int slot_idx, uint32_t* back_buffer, struct PS4G
     }
 }
 
-static void update_fps_counter(void) {
-    struct timespec ts;
-    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+/*
+ * Limitador de quadros de precisão de microssegundos via contador monotônico de hardware do Orbis OS
+ * (`sceKernelGetProcessTime`). Garante 60.00 Hz exatos (16.667 us/quadro) sem acelerar o jogo.
+ */
+static void pace_frame_60hz(void) {
+    const uint64_t frame_period_us = 16667ULL;
+    uint64_t now = sceKernelGetProcessTime();
+    if (s_frame_deadline_us == 0 || now > s_frame_deadline_us + 100000ULL) {
+        s_frame_deadline_us = now + frame_period_us;
         return;
     }
-    uint64_t now_us = (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)(ts.tv_nsec / 1000L);
-    if (s_fps_last_us == 0) {
+    while (now < s_frame_deadline_us) {
+        uint64_t rem = s_frame_deadline_us - now;
+        if (rem > 1500ULL) {
+            sceKernelUsleep((OrbisKernelUseconds)(rem - 1000ULL));
+        } else {
+            __builtin_ia32_pause();
+        }
+        now = sceKernelGetProcessTime();
+    }
+    s_frame_deadline_us += frame_period_us;
+    if (now > s_frame_deadline_us + frame_period_us) {
+        s_frame_deadline_us = now + frame_period_us;
+    }
+}
+
+static void update_fps_counter(void) {
+    uint64_t now_us = sceKernelGetProcessTime();
+    if (s_fps_last_us == 0 || now_us <= s_fps_last_us) {
         s_fps_last_us = now_us;
         s_fps_frame_count = 0;
         return;
     }
     s_fps_frame_count++;
     uint64_t elapsed_us = now_us - s_fps_last_us;
-    if (elapsed_us >= 250000ULL) {
-        s_current_fps = (int)((s_fps_frame_count * 1000000ULL + (elapsed_us / 2ULL)) / elapsed_us);
-        if (s_current_fps > 60) {
-            s_current_fps = 60;
+    if (elapsed_us >= 500000ULL) {
+        int fps = (int)(((uint64_t)s_fps_frame_count * 1000000ULL + (elapsed_us / 2ULL)) / elapsed_us);
+        int max_target = (s_fps_limit == PS4_FPS_30) ? 30 : 60;
+        if (fps > max_target && fps <= max_target + 2) {
+            fps = max_target;
+        } else if (fps > 999) {
+            fps = 999;
         }
+        s_current_fps = fps;
         s_fps_frame_count = 0;
         s_fps_last_us = now_us;
     }
@@ -896,10 +941,9 @@ void video_render_split_screen(struct PS4GBA_Context* ctx) {
         return;
     }
 
-    update_fps_counter();
-
     UIAppState ui_state = ui_menu_get_state();
     if (ui_state == UI_STATE_LAUNCHER) {
+        update_fps_counter();
         s_prev_ui_state = ui_state;
         s_clear_frames_remaining = NUM_FRAMEBUFFERS;
         ui_menu_render_launcher(back_buffer);
@@ -911,13 +955,24 @@ void video_render_split_screen(struct PS4GBA_Context* ctx) {
                               ORBIS_VIDEO_OUT_FLIP_VSYNC, flip_id);
         s_submitted_flip_arg = flip_id;
         s_buffer_index = (s_buffer_index + 1) % NUM_FRAMEBUFFERS;
+        pace_frame_60hz();
         return;
     }
+
+    bool osd_open = ui_menu_is_osd_open();
+
+    /* No modo 30 FPS, pula a composição/apresentação de vídeo nos frames ímpares
+     * mantendo a emulação do GBA e o áudio rodando a 60Hz constantes (velocidade 1x real). */
+    if (s_skip_frame_render && !osd_open) {
+        pace_frame_60hz();
+        return;
+    }
+
+    update_fps_counter();
 
     int active_count = ctx ? ctx->active_count : 0;
     int audio_focus = audio_get_focus_player();
     bool focus_highlight = (audio_get_mode() == PS4_AUDIO_MODE_FOCUS);
-    bool osd_open = ui_menu_is_osd_open();
     bool show_fps = ui_menu_is_fps_visible();
 
     if (s_prev_ui_state != ui_state ||
@@ -968,6 +1023,7 @@ void video_render_split_screen(struct PS4GBA_Context* ctx) {
                           ORBIS_VIDEO_OUT_FLIP_VSYNC, flip_id);
     s_submitted_flip_arg = flip_id;
     s_buffer_index = (s_buffer_index + 1) % NUM_FRAMEBUFFERS;
+    pace_frame_60hz();
 }
 
 void video_shutdown(void) {

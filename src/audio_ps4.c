@@ -255,37 +255,25 @@ int audio_get_focus_player(void) {
     return s_focused_player;
 }
 
-static inline size_t compute_target_48k_frames(size_t src_frames, unsigned sample_rate) {
-    if (src_frames == 0) {
-        return 0;
-    }
-    if (sample_rate < 8192U) {
-        sample_rate = 32768U;
-    }
-    /* Usa a taxa real do registrador SOUNDBIAS do GBA (ex: 32768Hz, 65536Hz, 131072Hz) */
-    size_t base_dst = (size_t)(((uint64_t)src_frames * PS4_AUDIO_SAMPLE_RATE + (sample_rate / 2U)) / sample_rate);
-
+static inline size_t compute_target_48k_frames(void) {
+    /* 48000 Hz / 60 fps = 800 frames por quadro de vídeo; ajuste suave pelo nível do ring buffer */
     uint32_t fill = ring_available_to_read();
     int32_t diff = (int32_t)RING_TARGET_FILL - (int32_t)fill;
-    int32_t adj = diff / 16;
-    if (adj > 48) {
-        adj = 48;
-    } else if (adj < -48) {
-        adj = -48;
+    int32_t adj = diff / 64;
+    if (adj > 16) {
+        adj = 16;
+    } else if (adj < -16) {
+        adj = -16;
     }
-    int32_t target = (int32_t)base_dst + adj;
-    if (target < 32) {
-        target = 32;
-    } else if (target > (int32_t)MAX_RESAMPLED_FRAME) {
-        target = (int32_t)MAX_RESAMPLED_FRAME;
-    }
-    return (size_t)target;
+    return (size_t)(800 + adj);
 }
 
 void audio_process(struct PS4GBA_Context* ctx) {
     if (!ctx || s_audio_handle < 0) {
         return;
     }
+
+    size_t target_frames = compute_target_48k_frames();
 
     if (s_audio_mode == PS4_AUDIO_MODE_FOCUS) {
         int focus = s_focused_player;
@@ -314,9 +302,7 @@ void audio_process(struct PS4GBA_Context* ctx) {
                 avail = GBA_AUDIO_BUFFER_SIZE;
             }
             if (avail > 0) {
-                unsigned sample_rate = core->audioSampleRate(core);
                 size_t read_frames = mAudioBufferRead(abuf, s_raw_buf, avail);
-                size_t target_frames = compute_target_48k_frames(read_frames, sample_rate);
                 size_t resampled = resample_stereo_linear(
                     i, s_raw_buf, read_frames, target_frames,
                     s_inst_resampled[0], MAX_RESAMPLED_FRAME
@@ -344,9 +330,7 @@ void audio_process(struct PS4GBA_Context* ctx) {
                 avail = GBA_AUDIO_BUFFER_SIZE;
             }
             if (avail > 0) {
-                unsigned sample_rate = core->audioSampleRate(core);
                 size_t read_frames = mAudioBufferRead(abuf, s_raw_buf, avail);
-                size_t target_frames = compute_target_48k_frames(read_frames, sample_rate);
                 s_inst_frames[i] = resample_stereo_linear(
                     i, s_raw_buf, read_frames, target_frames,
                     s_inst_resampled[i], MAX_RESAMPLED_FRAME

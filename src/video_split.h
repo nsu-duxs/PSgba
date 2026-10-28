@@ -33,6 +33,7 @@ void video_set_fps_limit(PS4FpsLimit limit);
 PS4FpsLimit video_get_fps_limit(void);
 void video_toggle_fps_limit(void);
 const char* video_get_fps_limit_name(PS4FpsLimit limit);
+bool video_begin_frame_should_skip_render(void);
 void video_render_instance_slot(int slot_idx, uint32_t* back_buffer, struct PS4GBA_Context* ctx);
 void video_render_split_screen(struct PS4GBA_Context* ctx);
 void video_request_clear_framebuffers(void);
