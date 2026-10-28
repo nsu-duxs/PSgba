@@ -1,11 +1,13 @@
 #include "emulator_manager.h"
 #include "link_cable_hub.h"
+#include "video_split.h"
 #include "audio_ps4.h"
 #include "save_manager.h"
 #include "input_ds4.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <orbis/libkernel.h>
 #include <mgba/core/log.h>
 #include <mgba-util/vfs.h>
 #include <mgba/internal/arm/arm.h>
@@ -14,9 +16,25 @@
 
 PS4GBA_Context g_gba_ctx = {0};
 
-static struct GBA* s_frame_gbas[GBA_MAX_INSTANCES];
-static uint32_t s_start_frames[GBA_MAX_INSTANCES];
-static uint32_t s_start_cycles[GBA_MAX_INSTANCES];
+static struct GBA* s_frame_gbas[GBA_MAX_INSTANCES] __attribute__((aligned(64)));
+static uint32_t s_start_frames[GBA_MAX_INSTANCES] __attribute__((aligned(64)));
+static uint32_t s_start_cycles[GBA_MAX_INSTANCES] __attribute__((aligned(64)));
+
+static uint32_t* s_video_back_buffer = NULL;
+static struct PS4GBA_Context* s_video_ctx = NULL;
+
+typedef struct __attribute__((aligned(64))) GBAWorker {
+    OrbisPthread thread;
+    int player_id;
+    volatile int command; /* 0 = idle, 1 = step_slice, 2 = finish_frame, 3 = terminate, 4 = render_video */
+    volatile uint32_t target_slice;
+    volatile bool running;
+    bool thread_created;
+} GBAWorker;
+
+static GBAWorker s_workers[GBA_MAX_INSTANCES] __attribute__((aligned(64))) = {0};
+
+static bool s_main_affinity_set = false;
 
 static void silent_mgba_log(struct mLogger* logger, int category, enum mLogLevel level,
                             const char* format, va_list args) {
@@ -170,6 +188,18 @@ static inline bool step_instance_slice(int idx, uint32_t slice_target) {
     struct mTimingEvent* lockstep_ev = &g_link_hub.drivers[idx].lockstep_event;
     bool master_started = false;
 
+    if (gba->cpu->halted) {
+        gba->cpu->cycles = 0;
+    }
+
+    int32_t init_rem = (int32_t)(target_time - (uint32_t)mTimingCurrentTime(&gba->timing));
+    if (init_rem <= 0) {
+        return false;
+    }
+
+    mTimingDeschedule(&gba->timing, lockstep_ev);
+    mTimingSchedule(&gba->timing, lockstep_ev, init_rem);
+
     while (gba->video.frameCounter == start_frame) {
         if (gba->cpu->halted) {
             gba->cpu->cycles = 0;
@@ -179,10 +209,12 @@ static inline bool step_instance_slice(int idx, uint32_t slice_target) {
             break;
         }
 
-        mTimingDeschedule(&gba->timing, lockstep_ev);
-        mTimingSchedule(&gba->timing, lockstep_ev, remaining);
+        if (!mTimingIsScheduled(&gba->timing, lockstep_ev)) {
+            mTimingSchedule(&gba->timing, lockstep_ev, remaining);
+        }
 
         if (gba->cpu->halted) {
+            gba->cpu->nextEvent = mTimingNextEvent(&gba->timing);
             gba->cpu->cycles = gba->cpu->nextEvent;
         }
 
@@ -195,6 +227,9 @@ static inline bool step_instance_slice(int idx, uint32_t slice_target) {
 
         if (idx == 0 && link_hub_consume_just_started()) {
             master_started = true;
+            break;
+        }
+        if (__atomic_load_n(&g_link_hub.slice_interrupt, __ATOMIC_ACQUIRE)) {
             break;
         }
     }
@@ -225,6 +260,144 @@ static inline void finish_instance_frame(int idx) {
         if (gba->cpu->halted) {
             gba->cpu->cycles = 0;
             gba->cpu->nextEvent = 0;
+        }
+    }
+}
+
+static void* worker_thread_main(void* arg) {
+    GBAWorker* w = (GBAWorker*)arg;
+    int idx = w->player_id;
+
+    /* Associa a thread de trabalho ao seu respectivo nucleo da CPU (P1->Core 1, P2->Core 2, P3->Core 3) */
+    scePthreadSetaffinity(w->thread, 1ULL << idx);
+
+    uint32_t idle_spins = 0;
+    while (__atomic_load_n(&w->running, __ATOMIC_ACQUIRE)) {
+        int cmd = __atomic_load_n(&w->command, __ATOMIC_ACQUIRE);
+        if (cmd == 0) {
+            __builtin_ia32_pause();
+            if (++idle_spins > 2000000U) {
+                sceKernelUsleep(200);
+                idle_spins = 2000000U;
+            }
+            continue;
+        }
+
+        idle_spins = 0;
+
+        if (cmd == 1) {
+            uint32_t target = w->target_slice;
+            step_instance_slice(idx, target);
+            __atomic_store_n(&w->command, 0, __ATOMIC_RELEASE);
+        } else if (cmd == 2) {
+            finish_instance_frame(idx);
+            __atomic_store_n(&w->command, 0, __ATOMIC_RELEASE);
+        } else if (cmd == 3) {
+            break;
+        } else if (cmd == 4) {
+            video_render_instance_slot(idx, s_video_back_buffer, s_video_ctx);
+            __atomic_store_n(&w->command, 0, __ATOMIC_RELEASE);
+        }
+    }
+    return NULL;
+}
+
+static void init_workers(void) {
+    if (!s_main_affinity_set) {
+        typedef OrbisPthread (*ScePthreadSelfFn)(void);
+        OrbisPthread self_thr = ((ScePthreadSelfFn)(uintptr_t)scePthreadSelf)();
+        scePthreadSetaffinity(self_thr, 1ULL << 0);
+        s_main_affinity_set = true;
+    }
+    for (int j = 1; j < GBA_MAX_INSTANCES; ++j) {
+        if (!s_workers[j].thread_created) {
+            memset(&s_workers[j], 0, sizeof(GBAWorker));
+            s_workers[j].player_id = j;
+            s_workers[j].running = true;
+            s_workers[j].command = 0;
+            s_workers[j].target_slice = 0;
+            char name[32];
+            snprintf(name, sizeof(name), "gba_worker_%d", j);
+            int ret = scePthreadCreate(&s_workers[j].thread, NULL, worker_thread_main, &s_workers[j], name);
+            if (ret == 0) {
+                s_workers[j].thread_created = true;
+                scePthreadSetaffinity(s_workers[j].thread, 1ULL << j);
+            }
+        }
+    }
+}
+
+static void stop_workers(void) {
+    for (int j = 1; j < GBA_MAX_INSTANCES; ++j) {
+        if (s_workers[j].thread_created) {
+            __atomic_store_n(&s_workers[j].running, false, __ATOMIC_RELEASE);
+            __atomic_store_n(&s_workers[j].command, 3, __ATOMIC_RELEASE);
+            scePthreadJoin(s_workers[j].thread, NULL);
+            s_workers[j].thread_created = false;
+        }
+    }
+}
+
+static inline void dispatch_slaves_slice(uint32_t target) {
+    for (int j = 1; j < GBA_MAX_INSTANCES; ++j) {
+        if (s_frame_gbas[j]) {
+            s_workers[j].target_slice = target;
+            __atomic_store_n(&s_workers[j].command, 1, __ATOMIC_RELEASE);
+        }
+    }
+}
+
+static inline void dispatch_slaves_finish(void) {
+    for (int j = 1; j < GBA_MAX_INSTANCES; ++j) {
+        if (s_frame_gbas[j]) {
+            __atomic_store_n(&s_workers[j].command, 2, __ATOMIC_RELEASE);
+        }
+    }
+}
+
+static inline void wait_slaves_done(void) {
+    for (int j = 1; j < GBA_MAX_INSTANCES; ++j) {
+        if (s_frame_gbas[j]) {
+            while (__atomic_load_n(&s_workers[j].command, __ATOMIC_ACQUIRE) != 0) {
+                __builtin_ia32_pause();
+            }
+        }
+    }
+}
+
+void emulator_parallel_render_video(uint32_t* back_buffer, struct PS4GBA_Context* ctx) {
+    if (!back_buffer || !ctx) {
+        return;
+    }
+    if (ctx->active_count <= 1) {
+        for (int i = 0; i < GBA_MAX_INSTANCES; ++i) {
+            if (ctx->instances[i].active && ctx->instances[i].video_buffer) {
+                video_render_instance_slot(i, back_buffer, ctx);
+            }
+        }
+        return;
+    }
+
+    init_workers();
+    s_video_back_buffer = back_buffer;
+    s_video_ctx = ctx;
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+
+    for (int j = 1; j < GBA_MAX_INSTANCES; ++j) {
+        if (ctx->instances[j].active && ctx->instances[j].video_buffer) {
+            __atomic_store_n(&s_workers[j].command, 4, __ATOMIC_RELEASE);
+        }
+    }
+
+    if (ctx->instances[0].active && ctx->instances[0].video_buffer) {
+        video_render_instance_slot(0, back_buffer, ctx);
+    }
+
+    for (int j = 1; j < GBA_MAX_INSTANCES; ++j) {
+        if (ctx->instances[j].active && ctx->instances[j].video_buffer) {
+            while (__atomic_load_n(&s_workers[j].command, __ATOMIC_ACQUIRE) != 0) {
+                __builtin_ia32_pause();
+            }
         }
     }
 }
@@ -326,42 +499,62 @@ void emulator_step_lockstep_frame(void) {
         return;
     }
 
+    init_workers();
+
     link_hub_begin_frame();
 
     uint32_t slice_target = 0;
     while (slice_target < VIDEO_TOTAL_LENGTH) {
         bool xfer_active = link_hub_is_transfer_active();
-        uint32_t step = xfer_active ? 64U : 256U;
+        uint32_t step = xfer_active ? VIDEO_HORIZONTAL_LENGTH : 4096U;
         slice_target += step;
         if (slice_target > VIDEO_TOTAL_LENGTH) {
             slice_target = VIDEO_TOTAL_LENGTH;
         }
 
+        __atomic_store_n(&g_link_hub.slice_interrupt, false, __ATOMIC_RELEASE);
+
+        /* Dispara os Escravos (Players 1..3 nos Cores 1..3) ANTES de avançar o Mestre (Player 0 no Core 0),
+         * garantindo execução 100% simultânea em paralelo nos 4 núcleos Jaguar! */
+        dispatch_slaves_slice(slice_target);
+        bool master_started = false;
         if (s_frame_gbas[0]) {
-            bool master_started = step_instance_slice(0, slice_target);
-            if (master_started) {
-                /*
-                 * O Mestre (Player 0) acabou de iniciar uma transferência no ciclo `master_elapsed`.
-                 * 1. Avança todos os Escravos (Players 1..3) exatamente até `master_elapsed`.
-                 * 2. Agenda o evento de conclusão da transferência nos Escravos no ciclo exato.
-                 * 3. Conclui o restante da fatia `slice_target` para todas as instâncias.
-                 */
-                uint32_t master_elapsed =
-                    (uint32_t)(mTimingCurrentTime(&s_frame_gbas[0]->timing) - s_start_cycles[0]);
-                for (int j = 1; j < GBA_MAX_INSTANCES; ++j) {
-                    if (s_frame_gbas[j]) {
-                        step_instance_slice(j, master_elapsed);
-                    }
-                }
-                link_hub_begin_transfer_on_slaves();
+            master_started = step_instance_slice(0, slice_target);
+        }
+        wait_slaves_done();
+
+        if (master_started && s_frame_gbas[0]) {
+            uint32_t master_elapsed =
+                (uint32_t)(mTimingCurrentTime(&s_frame_gbas[0]->timing) - s_start_cycles[0]);
+            __atomic_store_n(&g_link_hub.slice_interrupt, false, __ATOMIC_RELEASE);
+            dispatch_slaves_slice(master_elapsed);
+            wait_slaves_done();
+
+            link_hub_begin_transfer_on_slaves(master_elapsed, s_start_cycles);
+
+            if (g_link_hub.transfer_finish_elapsed > master_elapsed &&
+                g_link_hub.transfer_finish_elapsed < slice_target) {
+                slice_target = g_link_hub.transfer_finish_elapsed;
+            }
+
+            __atomic_store_n(&g_link_hub.slice_interrupt, false, __ATOMIC_RELEASE);
+            dispatch_slaves_slice(slice_target);
+            step_instance_slice(0, slice_target);
+            wait_slaves_done();
+        } else if (__atomic_load_n(&g_link_hub.slice_interrupt, __ATOMIC_ACQUIRE)) {
+            link_hub_sync_pins();
+            __atomic_store_n(&g_link_hub.slice_interrupt, false, __ATOMIC_RELEASE);
+            dispatch_slaves_slice(slice_target);
+            if (s_frame_gbas[0]) {
                 step_instance_slice(0, slice_target);
             }
+            wait_slaves_done();
         }
 
-        for (int i = 1; i < GBA_MAX_INSTANCES; ++i) {
-            if (s_frame_gbas[i]) {
-                step_instance_slice(i, slice_target);
-            }
+        if (g_link_hub.transfer_in_progress &&
+            (g_link_hub.transfer_finished_mask == g_link_hub.transfer_scheduled_mask) &&
+            g_link_hub.transfer_scheduled_mask != 0) {
+            link_hub_latch_transfer_data();
         }
 
         link_hub_sync_pins();
@@ -371,14 +564,16 @@ void emulator_step_lockstep_frame(void) {
         }
     }
 
-    for (int i = 0; i < GBA_MAX_INSTANCES; ++i) {
-        if (s_frame_gbas[i]) {
-            finish_instance_frame(i);
-        }
+    /* Finaliza o frame em paralelo em todos os núcleos */
+    dispatch_slaves_finish();
+    if (s_frame_gbas[0]) {
+        finish_instance_frame(0);
     }
+    wait_slaves_done();
 }
 
 void emulator_destroy_all(void) {
+    stop_workers();
     link_hub_destroy();
 
     for (int i = 0; i < GBA_MAX_INSTANCES; ++i) {

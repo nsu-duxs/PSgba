@@ -100,7 +100,7 @@ struct tm* localtime_r(const time_t* restrict t, struct tm* restrict tm_out) {
  * ============================================================================ */
 #define ORBIS_HEAP_MAGIC 0x4F424850U
 
-typedef struct OrbisHeapBlock {
+typedef struct __attribute__((aligned(64))) OrbisHeapBlock {
     size_t size;
     struct OrbisHeapBlock* next;
     struct OrbisHeapBlock* prev;
@@ -109,6 +109,7 @@ typedef struct OrbisHeapBlock {
 } OrbisHeapBlock;
 
 static OrbisHeapBlock* s_heap_head = NULL;
+static OrbisHeapBlock* s_heap_rover = NULL;
 static uintptr_t s_heap_start = 0;
 static uintptr_t s_heap_end = 0;
 static volatile unsigned char s_heap_lock = 0;
@@ -155,6 +156,7 @@ static bool heap_ensure_initialized(void) {
                 s_heap_head->prev = NULL;
                 s_heap_head->is_free = 1;
                 s_heap_head->magic = ORBIS_HEAP_MAGIC;
+                s_heap_rover = s_heap_head;
                 return true;
             }
             sceKernelReleaseDirectMemory(phys_addr, pool_size);
@@ -169,25 +171,37 @@ static void* heap_alloc_unlocked(size_t size) {
         return NULL;
     }
 
-    size_t aligned = (size == 0) ? 32 : ((size + 31U) & ~((size_t)31U));
-    for (OrbisHeapBlock* cur = s_heap_head; cur != NULL; cur = cur->next) {
-        if (cur->is_free && cur->size >= aligned) {
-            if (cur->size >= aligned + sizeof(OrbisHeapBlock) + 64U) {
-                OrbisHeapBlock* split = (OrbisHeapBlock*)((uint8_t*)(cur + 1) + aligned);
-                split->size = cur->size - aligned - sizeof(OrbisHeapBlock);
-                split->is_free = 1;
-                split->magic = ORBIS_HEAP_MAGIC;
-                split->next = cur->next;
-                split->prev = cur;
-                if (split->next) {
-                    split->next->prev = split;
-                }
-                cur->next = split;
-                cur->size = aligned;
+    size_t aligned = (size == 0) ? 64U : ((size + 63U) & ~((size_t)63U));
+    OrbisHeapBlock* start = s_heap_rover ? s_heap_rover : s_heap_head;
+    OrbisHeapBlock* cur = start;
+
+    for (int pass = 0; pass < 2; ++pass) {
+        for (; cur != NULL; cur = cur->next) {
+            if (pass == 1 && cur == start) {
+                break;
             }
-            cur->is_free = 0;
-            return (void*)(cur + 1);
+            if (cur->is_free && cur->size >= aligned) {
+                if (cur->size >= aligned + sizeof(OrbisHeapBlock) + 64U) {
+                    OrbisHeapBlock* split = (OrbisHeapBlock*)((uint8_t*)(cur + 1) + aligned);
+                    split->size = cur->size - aligned - sizeof(OrbisHeapBlock);
+                    split->is_free = 1;
+                    split->magic = ORBIS_HEAP_MAGIC;
+                    split->next = cur->next;
+                    split->prev = cur;
+                    if (split->next) {
+                        split->next->prev = split;
+                    }
+                    cur->next = split;
+                    cur->size = aligned;
+                    s_heap_rover = split;
+                } else {
+                    s_heap_rover = cur->next ? cur->next : s_heap_head;
+                }
+                cur->is_free = 0;
+                return (void*)(cur + 1);
+            }
         }
+        cur = s_heap_head;
     }
     return NULL;
 }
@@ -210,6 +224,9 @@ static void heap_free_unlocked(void* ptr) {
 
     if (block->next && block->next->is_free) {
         OrbisHeapBlock* n = block->next;
+        if (s_heap_rover == n) {
+            s_heap_rover = block;
+        }
         block->size += sizeof(OrbisHeapBlock) + n->size;
         block->next = n->next;
         if (block->next) {
@@ -219,12 +236,18 @@ static void heap_free_unlocked(void* ptr) {
 
     if (block->prev && block->prev->is_free) {
         OrbisHeapBlock* p = block->prev;
+        if (s_heap_rover == block) {
+            s_heap_rover = p;
+        }
         p->size += sizeof(OrbisHeapBlock) + block->size;
         p->next = block->next;
         if (p->next) {
             p->next->prev = p;
         }
+        block = p;
     }
+
+    s_heap_rover = block;
 }
 
 void* malloc(size_t size) {
@@ -277,7 +300,7 @@ void* realloc(void* ptr, size_t size) {
     }
 
     size_t old_size = block->size;
-    size_t aligned = (size + 31U) & ~((size_t)31U);
+    size_t aligned = (size + 63U) & ~((size_t)63U);
     if (old_size >= aligned) {
         heap_unlock();
         return ptr;
@@ -286,6 +309,9 @@ void* realloc(void* ptr, size_t size) {
     if (block->next && block->next->is_free &&
         (old_size + sizeof(OrbisHeapBlock) + block->next->size) >= aligned) {
         OrbisHeapBlock* n = block->next;
+        if (s_heap_rover == n) {
+            s_heap_rover = block;
+        }
         block->size += sizeof(OrbisHeapBlock) + n->size;
         block->next = n->next;
         if (block->next) {
@@ -303,6 +329,7 @@ void* realloc(void* ptr, size_t size) {
             }
             block->next = split;
             block->size = aligned;
+            s_heap_rover = split;
         }
         heap_unlock();
         return ptr;
@@ -318,6 +345,10 @@ void* realloc(void* ptr, size_t size) {
 }
 
 int main(int argc, char* argv[]) {
+    /* Fixa a thread principal (Player 0) exclusivamente no Nucleo 0 do Cluster 0 Jaguar */
+    typedef OrbisPthread (*ScePthreadSelfFn)(void);
+    OrbisPthread main_thread = ((ScePthreadSelfFn)(uintptr_t)scePthreadSelf)();
+    scePthreadSetaffinity(main_thread, 1ULL << 0);
     ps4_jailbreak_system();
     (void)argc;
     (void)argv;

@@ -12,7 +12,7 @@
 
 typedef struct PS4LinkHub PS4LinkHub;
 
-typedef struct PS4LinkDriver {
+typedef struct __attribute__((aligned(64))) PS4LinkDriver {
     struct GBASIODriver d;
     PS4LinkHub* hub;
     int player_id;
@@ -22,7 +22,7 @@ typedef struct PS4LinkDriver {
     struct mTimingEvent lockstep_event;
 } PS4LinkDriver;
 
-struct PS4LinkHub {
+struct __attribute__((aligned(64))) PS4LinkHub {
     struct GBA* gba[LINK_MAX_PLAYERS];
     PS4LinkDriver drivers[LINK_MAX_PLAYERS];
     int active_count;
@@ -33,13 +33,15 @@ struct PS4LinkHub {
     uint32_t normal32_data[LINK_MAX_PLAYERS];
     enum GBASIOMode transfer_mode;
     int32_t transfer_cycles;
-    uint32_t transfer_scheduled_mask;
-    uint32_t transfer_finished_mask;
-    bool transfer_data_latched;
+    uint32_t transfer_finish_elapsed;
+    volatile uint32_t transfer_scheduled_mask;
+    volatile uint32_t transfer_finished_mask;
+    volatile bool transfer_data_latched;
     bool cable_enabled;
     uint32_t hotplug_disconnect_frames;
-    bool transfer_in_progress;
-    bool transfer_just_started;
+    volatile bool transfer_in_progress;
+    volatile bool transfer_just_started;
+    volatile bool slice_interrupt;
     volatile int active_transfer_lines;
 };
 
@@ -51,7 +53,8 @@ bool link_hub_attach_instance(int player_id, struct mCore* core);
 void link_hub_reset(void);
 void link_hub_begin_frame(void);
 void link_hub_sync_pins(void);
-void link_hub_begin_transfer_on_slaves(void);
+void link_hub_latch_transfer_data(void);
+void link_hub_begin_transfer_on_slaves(uint32_t master_elapsed, const uint32_t start_cycles[LINK_MAX_PLAYERS]);
 void link_hub_destroy(void);
 
 /* Controle de Conexão Física / Hotplug do Link Cable */

@@ -17,11 +17,23 @@ typedef enum PS4VideoResMode {
     PS4_RES_MODE_COUNT = 5
 } PS4VideoResMode;
 
+typedef enum PS4FpsLimit {
+    PS4_FPS_60 = 0,
+    PS4_FPS_30 = 1,
+    PS4_FPS_LIMIT_COUNT = 2
+} PS4FpsLimit;
+
 bool video_init(void);
 void video_set_res_mode(PS4VideoResMode mode);
 PS4VideoResMode video_get_res_mode(void);
 void video_cycle_res_mode(int delta);
 const char* video_get_res_mode_name(PS4VideoResMode mode);
+
+void video_set_fps_limit(PS4FpsLimit limit);
+PS4FpsLimit video_get_fps_limit(void);
+void video_toggle_fps_limit(void);
+const char* video_get_fps_limit_name(PS4FpsLimit limit);
+void video_render_instance_slot(int slot_idx, uint32_t* back_buffer, struct PS4GBA_Context* ctx);
 void video_render_split_screen(struct PS4GBA_Context* ctx);
 void video_request_clear_framebuffers(void);
 void video_shutdown(void);

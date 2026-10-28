@@ -11,7 +11,7 @@
 #define GBA_SCREEN_WIDTH  240
 #define GBA_SCREEN_HEIGHT 160
 
-typedef struct PS4GBA_Instance {
+typedef struct __attribute__((aligned(64))) PS4GBA_Instance {
     struct mCore* core;
     uint32_t* video_buffer;
     bool active;
@@ -32,6 +32,7 @@ bool emulator_init_session(const char* const rom_paths[GBA_MAX_INSTANCES], int n
 bool emulator_init_all(const char* rom_path);
 bool emulator_join_player(int slot_index, OrbisUserServiceUserId user_id);
 void emulator_step_lockstep_frame(void);
+void emulator_parallel_render_video(uint32_t* back_buffer, struct PS4GBA_Context* ctx);
 void emulator_destroy_all(void);
 
 #endif /* EMULATOR_MANAGER_H */

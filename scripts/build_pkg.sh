@@ -8,7 +8,7 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-BUILD_DIR="${1:-${PROJECT_ROOT}/build}"
+BUILD_DIR="$(cd "${1:-${PROJECT_ROOT}/build}" 2>/dev/null && pwd || echo "${PROJECT_ROOT}/build")"
 EBOOT_BIN="${BUILD_DIR}/eboot.bin"
 ASSETS_DIR="${PROJECT_ROOT}/assets"
 PKG_ROOT="${BUILD_DIR}/pkg_root"

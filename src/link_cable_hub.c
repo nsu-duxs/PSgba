@@ -9,6 +9,39 @@
 
 PS4LinkHub g_link_hub = {0};
 
+static volatile unsigned char s_link_lock = 0;
+
+static inline void link_lock(void) {
+    while (__atomic_test_and_set(&s_link_lock, __ATOMIC_ACQUIRE)) {
+        __builtin_ia32_pause();
+    }
+}
+
+static inline void link_unlock(void) {
+    __atomic_clear(&s_link_lock, __ATOMIC_RELEASE);
+}
+
+static inline bool _link_is_player_xfer_busy(const PS4LinkHub* hub, int i) {
+    if (!hub || !__atomic_load_n(&hub->transfer_in_progress, __ATOMIC_ACQUIRE)) {
+        return false;
+    }
+    if (i == 0 && __atomic_load_n(&hub->transfer_just_started, __ATOMIC_ACQUIRE)) {
+        return true;
+    }
+    uint32_t sched = __atomic_load_n(&hub->transfer_scheduled_mask, __ATOMIC_ACQUIRE);
+    uint32_t fin = __atomic_load_n(&hub->transfer_finished_mask, __ATOMIC_ACQUIRE);
+    return ((sched & ~fin) & (1U << i)) != 0;
+}
+
+static inline void _link_hub_request_slice_sync(PS4LinkHub* hub) {
+    __atomic_store_n(&hub->slice_interrupt, true, __ATOMIC_RELEASE);
+    for (int i = 0; i < hub->active_count; ++i) {
+        if (hub->gba[i]) {
+            __atomic_store_n(&hub->gba[i]->earlyExit, true, __ATOMIC_RELEASE);
+        }
+    }
+}
+
 static void _link_transfer_event_cb(struct mTiming* timing, void* user, uint32_t cyclesLate);
 static void _link_lockstep_event_cb(struct mTiming* timing, void* user, uint32_t cyclesLate);
 
@@ -59,24 +92,26 @@ static bool _link_hub_is_sd_ready(const PS4LinkHub* hub) {
  * da transferência). Isso impede que `transfer_in_progress` ou o bit Busy (bit 7)
  * fiquem travados em 1 permanentemente.
  */
-static void _link_hub_abort_transfer(PS4LinkHub* hub) {
+static void _link_hub_abort_transfer_ex(PS4LinkHub* hub, bool workers_stopped) {
     if (!hub) {
         return;
     }
 
-    hub->transfer_in_progress = false;
-    hub->transfer_just_started = false;
-    hub->transfer_data_latched = false;
-    hub->transfer_scheduled_mask = 0;
-    hub->transfer_finished_mask = 0;
+    __atomic_store_n(&hub->transfer_in_progress, false, __ATOMIC_RELEASE);
+    __atomic_store_n(&hub->transfer_just_started, false, __ATOMIC_RELEASE);
+    __atomic_store_n(&hub->transfer_data_latched, false, __ATOMIC_RELEASE);
+    __atomic_store_n(&hub->transfer_scheduled_mask, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&hub->transfer_finished_mask, 0, __ATOMIC_RELEASE);
 
     for (int i = 0; i < hub->active_count; ++i) {
         struct GBA* g = hub->gba[i];
         if (!g) {
             continue;
         }
-        mTimingDeschedule(&g->timing, &hub->drivers[i].transfer_event);
-        mTimingDeschedule(&g->timing, &g->sio.completeEvent);
+        if (workers_stopped || i == 0) {
+            mTimingDeschedule(&g->timing, &hub->drivers[i].transfer_event);
+            mTimingDeschedule(&g->timing, &g->sio.completeEvent);
+        }
 
         if (g->sio.mode == GBA_SIO_MULTI) {
             g->sio.siocnt = GBASIOMultiplayerClearBusy(g->sio.siocnt);
@@ -91,6 +126,10 @@ static void _link_hub_abort_transfer(PS4LinkHub* hub) {
             g->memory.io[GBA_REG(RCNT)] = g->sio.rcnt;
         }
     }
+}
+
+static void _link_hub_abort_transfer(PS4LinkHub* hub) {
+    _link_hub_abort_transfer_ex(hub, true);
 }
 
 /*
@@ -206,8 +245,7 @@ static void _link_hub_refresh_multi_status(PS4LinkHub* hub) {
             continue;
         }
 
-        bool is_xfer_scheduled = mTimingIsScheduled(&g->timing, &hub->drivers[i].transfer_event) ||
-                                 (i == 0 && hub->transfer_just_started);
+        bool is_xfer_scheduled = _link_is_player_xfer_busy(hub, i);
 
         if (g->sio.mode == GBA_SIO_MULTI) {
             hub->drivers[i].has_entered_multi = true;
@@ -263,10 +301,10 @@ static void _link_hub_refresh_multi_status(PS4LinkHub* hub) {
  * transferência quando os ciclos da linha serial se completam.
  */
 static void _link_hub_latch_transfer_data(PS4LinkHub* hub) {
-    if (!hub || hub->transfer_data_latched) {
+    if (!hub || __atomic_load_n(&hub->transfer_data_latched, __ATOMIC_ACQUIRE)) {
         return;
     }
-    hub->transfer_data_latched = true;
+    __atomic_store_n(&hub->transfer_data_latched, true, __ATOMIC_RELEASE);
 
     if (hub->transfer_mode == GBA_SIO_MULTI) {
         for (int i = 0; i < LINK_MAX_PLAYERS; ++i) {
@@ -301,6 +339,12 @@ static void _link_hub_latch_transfer_data(PS4LinkHub* hub) {
     __atomic_store_n(&hub->active_transfer_lines, 16, __ATOMIC_RELEASE);
 }
 
+void link_hub_latch_transfer_data(void) {
+    link_lock();
+    _link_hub_latch_transfer_data(&g_link_hub);
+    link_unlock();
+}
+
 /*
  * Callback de evento `mTiming` disparado individualmente em CADA GBA (Mestre e Escravos)
  * no ciclo exato de término da transferência serial (`GBASIOTransferCycles`).
@@ -317,18 +361,33 @@ static void _link_transfer_event_cb(struct mTiming* timing, void* user, uint32_t
     struct GBA* gba = sio->p;
     int id = self->player_id;
 
+    link_lock();
     if (!_link_hub_is_physically_linked(hub)) {
-        _link_hub_abort_transfer(hub);
+        _link_hub_abort_transfer_ex(hub, false);
+        link_unlock();
+        return;
+    }
+
+    if (!__atomic_load_n(&hub->transfer_in_progress, __ATOMIC_ACQUIRE) ||
+        !(__atomic_load_n(&hub->transfer_scheduled_mask, __ATOMIC_ACQUIRE) & (1U << id))) {
+        link_unlock();
         return;
     }
 
     _link_hub_latch_transfer_data(hub);
-
     bool sd_ready = _link_hub_is_sd_ready(hub);
+    enum GBASIOMode xfer_mode = hub->transfer_mode;
+    uint16_t local_multi[LINK_MAX_PLAYERS];
+    for (int i = 0; i < LINK_MAX_PLAYERS; ++i) {
+        local_multi[i] = hub->multi_data[i];
+    }
+    uint8_t local_norm8 = (id == 0) ? hub->normal8_data[1] : hub->normal8_data[0];
+    uint32_t local_norm32 = (id == 0) ? hub->normal32_data[1] : hub->normal32_data[0];
+    link_unlock();
 
-    if (hub->transfer_mode == GBA_SIO_MULTI) {
+    if (xfer_mode == GBA_SIO_MULTI) {
         if (sio->mode == GBA_SIO_MULTI || id == 0) {
-            GBASIOMultiplayerFinishTransfer(sio, hub->multi_data, cyclesLate);
+            GBASIOMultiplayerFinishTransfer(sio, local_multi, cyclesLate);
 
             uint16_t scnt = sio->siocnt;
             scnt = GBASIOMultiplayerClearBusy(scnt);
@@ -350,29 +409,28 @@ static void _link_transfer_event_cb(struct mTiming* timing, void* user, uint32_t
             sio->rcnt = rcnt;
             gba->memory.io[GBA_REG(RCNT)] = rcnt;
         }
-    } else if (hub->transfer_mode == GBA_SIO_NORMAL_8) {
+    } else if (xfer_mode == GBA_SIO_NORMAL_8) {
         if (id == 0 || id == 1) {
-            uint8_t recv_byte = (id == 0) ? hub->normal8_data[1] : hub->normal8_data[0];
             if (sio->mode == GBA_SIO_NORMAL_8 || id == 0) {
-                GBASIONormal8FinishTransfer(sio, recv_byte, cyclesLate);
+                GBASIONormal8FinishTransfer(sio, local_norm8, cyclesLate);
                 sio->siocnt = GBASIONormalSetSi(sio->siocnt, id != 0 ? 1 : 0);
                 gba->memory.io[GBA_REG(SIOCNT)] = sio->siocnt;
             }
         }
-    } else if (hub->transfer_mode == GBA_SIO_NORMAL_32) {
+    } else if (xfer_mode == GBA_SIO_NORMAL_32) {
         if (id == 0 || id == 1) {
-            uint32_t recv_word = (id == 0) ? hub->normal32_data[1] : hub->normal32_data[0];
             if (sio->mode == GBA_SIO_NORMAL_32 || id == 0) {
-                GBASIONormal32FinishTransfer(sio, recv_word, cyclesLate);
+                GBASIONormal32FinishTransfer(sio, local_norm32, cyclesLate);
                 sio->siocnt = GBASIONormalSetSi(sio->siocnt, id != 0 ? 1 : 0);
                 gba->memory.io[GBA_REG(SIOCNT)] = sio->siocnt;
             }
         }
     }
 
-    hub->transfer_finished_mask |= (1U << id);
-    if ((hub->transfer_finished_mask & hub->transfer_scheduled_mask) == hub->transfer_scheduled_mask) {
-        hub->transfer_in_progress = false;
+    uint32_t fin = __atomic_or_fetch(&hub->transfer_finished_mask, (1U << id), __ATOMIC_ACQ_REL);
+    uint32_t sched = __atomic_load_n(&hub->transfer_scheduled_mask, __ATOMIC_ACQUIRE);
+    if ((fin & sched) == sched) {
+        __atomic_store_n(&hub->transfer_in_progress, false, __ATOMIC_RELEASE);
     }
 }
 
@@ -446,6 +504,7 @@ static void _link_driver_set_mode(struct GBASIODriver* driver, enum GBASIOMode m
 
     PS4LinkHub* hub = self->hub;
 
+    link_lock();
     /*
      * Idêntico ao `GBASIOLockstepDriverSetMode` do mGBA (`lockstep.c` linha 611):
      * Se o Mestre (Player 0) trocar de modo enquanto uma transferência estiver
@@ -453,7 +512,7 @@ static void _link_driver_set_mode(struct GBASIODriver* driver, enum GBASIOMode m
      * deixar o estado Busy preso.
      */
     if (hub->transfer_in_progress && self->player_id == 0 && mode != hub->transfer_mode) {
-        _link_hub_abort_transfer(hub);
+        _link_hub_abort_transfer_ex(hub, false);
     }
 
     if (mode == GBA_SIO_MULTI) {
@@ -465,6 +524,8 @@ static void _link_driver_set_mode(struct GBASIODriver* driver, enum GBASIOMode m
 
     _link_hub_refresh_multi_status(hub);
     __atomic_store_n(&hub->active_transfer_lines, 16, __ATOMIC_RELEASE);
+    _link_hub_request_slice_sync(hub);
+    link_unlock();
 }
 
 static bool _link_driver_handles_mode(struct GBASIODriver* driver, enum GBASIOMode mode) {
@@ -501,13 +562,17 @@ static uint16_t _link_driver_write_rcnt(struct GBASIODriver* driver, uint16_t va
     PS4LinkHub* hub = self->hub;
 
     if (driver->p && driver->p->mode == GBA_SIO_GPIO) {
+        link_lock();
         driver->p->rcnt = value;
         if (hub) {
             _link_hub_sync_gpio_chain(hub);
             _link_hub_refresh_multi_status(hub);
             __atomic_store_n(&hub->active_transfer_lines, 16, __ATOMIC_RELEASE);
+            _link_hub_request_slice_sync(hub);
         }
-        return driver->p->rcnt;
+        uint16_t ret_rcnt = driver->p->rcnt;
+        link_unlock();
+        return ret_rcnt;
     }
 
     /*
@@ -517,6 +582,7 @@ static uint16_t _link_driver_write_rcnt(struct GBASIODriver* driver, uint16_t va
      * e preserva apenas os bits 0..3 que já estavam em `sio->rcnt` (`driver->p->rcnt`)!
      * Portanto, devemos atualizar os bits 0..3 diretamente em `driver->p->rcnt` antes de retornar.
      */
+    link_lock();
     if (!_link_hub_is_physically_linked(hub)) {
         value = GBASIORegisterRCNTFillSc(value);
         value = GBASIORegisterRCNTSetSi(value, 1);
@@ -524,6 +590,7 @@ static uint16_t _link_driver_write_rcnt(struct GBASIODriver* driver, uint16_t va
         if (driver->p) {
             driver->p->rcnt = (driver->p->rcnt & ~0x000FU) | (value & 0x000FU);
         }
+        link_unlock();
         return value;
     }
 
@@ -539,6 +606,7 @@ static uint16_t _link_driver_write_rcnt(struct GBASIODriver* driver, uint16_t va
     if (hub) {
         _link_hub_refresh_multi_status(hub);
     }
+    link_unlock();
     return value;
 }
 
@@ -549,11 +617,13 @@ static uint16_t _link_driver_write_siocnt(struct GBASIODriver* driver, uint16_t 
         return value;
     }
 
+    link_lock();
     if (!_link_hub_is_physically_linked(hub)) {
         value = GBASIOMultiplayerClearReady(value);
         value = GBASIOMultiplayerSetSlave(value, 1);
         value = GBASIOMultiplayerSetId(value, 0);
         value = GBASIOMultiplayerClearBusy(value);
+        link_unlock();
         return value;
     }
 
@@ -565,7 +635,7 @@ static uint16_t _link_driver_write_siocnt(struct GBASIODriver* driver, uint16_t 
      * de Baud Rate 0..1). Calculamos os ciclos exatos da transferência e agendamos o
      * evento de conclusão do Mestre no `mTiming`.
      */
-    if (self->player_id == 0 && hub->transfer_just_started && driver->p->p) {
+    if (self->player_id == 0 && __atomic_load_n(&hub->transfer_just_started, __ATOMIC_ACQUIRE) && driver->p->p) {
         struct GBA* gba0 = driver->p->p;
         int connected = hub->active_count - 1;
         int32_t cycles = GBASIOTransferCycles(mode, value, connected);
@@ -573,17 +643,18 @@ static uint16_t _link_driver_write_siocnt(struct GBASIODriver* driver, uint16_t 
             cycles = LINK_MIN_TRANSFER_CYCLES;
         }
         hub->transfer_cycles = cycles;
-        hub->transfer_scheduled_mask = (1U << 0);
-        hub->transfer_finished_mask = 0;
+        __atomic_store_n(&hub->transfer_scheduled_mask, (1U << 0), __ATOMIC_RELEASE);
+        __atomic_store_n(&hub->transfer_finished_mask, 0, __ATOMIC_RELEASE);
 
         mTimingDeschedule(&gba0->timing, &self->transfer_event);
         mTimingSchedule(&gba0->timing, &self->transfer_event, cycles);
 
-        /* Força saída imediata do `ARMRunLoop` do Mestre para alinhar os Escravos no ciclo exato */
+        /* Força saída imediata do `ARMRunLoop` do Mestre e dos Escravos para alinhar no ciclo exato */
         if (gba0->cpu) {
             gba0->cpu->nextEvent = gba0->cpu->cycles;
         }
         GBAInterrupt(gba0);
+        _link_hub_request_slice_sync(hub);
     }
 
     if (mode == GBA_SIO_MULTI) {
@@ -601,11 +672,11 @@ static uint16_t _link_driver_write_siocnt(struct GBASIODriver* driver, uint16_t 
         value = GBASIOMultiplayerSetId(value, self->player_id);
         value = GBASIOMultiplayerClearError(value);
 
-        bool is_busy = mTimingIsScheduled(&driver->p->p->timing, &self->transfer_event) ||
-                       (self->player_id == 0 && hub->transfer_just_started);
+        bool is_busy = _link_is_player_xfer_busy(hub, self->player_id);
         if (is_busy) {
             value = GBASIOMultiplayerFillBusy(value);
             driver->p->rcnt = GBASIORegisterRCNTClearSc(driver->p->rcnt);
+            __atomic_store_n(&hub->active_transfer_lines, 16, __ATOMIC_RELEASE);
         } else {
             value = GBASIOMultiplayerClearBusy(value);
             driver->p->rcnt = GBASIORegisterRCNTFillSc(driver->p->rcnt);
@@ -617,21 +688,24 @@ static uint16_t _link_driver_write_siocnt(struct GBASIODriver* driver, uint16_t 
             driver->p->p->memory.io[GBA_REG(RCNT)] = driver->p->rcnt;
         }
 
-        __atomic_store_n(&hub->active_transfer_lines, 16, __ATOMIC_RELEASE);
+        link_unlock();
         return value;
     }
 
     if (mode == GBA_SIO_NORMAL_32 || mode == GBA_SIO_NORMAL_8) {
         value = GBASIONormalSetSi(value, self->player_id != 0 ? 1 : 0);
-        bool is_busy = mTimingIsScheduled(&driver->p->p->timing, &self->transfer_event) ||
-                       (self->player_id == 0 && hub->transfer_just_started);
+        bool is_busy = _link_is_player_xfer_busy(hub, self->player_id);
         if (self->player_id != 0 && !is_busy) {
             value = GBASIONormalClearStart(value);
         }
-        __atomic_store_n(&hub->active_transfer_lines, 16, __ATOMIC_RELEASE);
+        if (is_busy) {
+            __atomic_store_n(&hub->active_transfer_lines, 16, __ATOMIC_RELEASE);
+        }
+        link_unlock();
         return value;
     }
 
+    link_unlock();
     return value;
 }
 
@@ -651,17 +725,19 @@ static bool _link_driver_start(struct GBASIODriver* driver) {
         return false;
     }
 
+    link_lock();
     if (hub->transfer_in_progress) {
-        _link_hub_abort_transfer(hub);
+        _link_hub_abort_transfer_ex(hub, false);
     }
 
     hub->transfer_mode = mode;
-    hub->transfer_in_progress = true;
-    hub->transfer_just_started = true;
-    hub->transfer_data_latched = false;
-    hub->transfer_scheduled_mask = (1U << 0);
-    hub->transfer_finished_mask = 0;
+    __atomic_store_n(&hub->transfer_in_progress, true, __ATOMIC_RELEASE);
+    __atomic_store_n(&hub->transfer_just_started, true, __ATOMIC_RELEASE);
+    __atomic_store_n(&hub->transfer_data_latched, false, __ATOMIC_RELEASE);
+    __atomic_store_n(&hub->transfer_scheduled_mask, (1U << 0), __ATOMIC_RELEASE);
+    __atomic_store_n(&hub->transfer_finished_mask, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&hub->active_transfer_lines, 16, __ATOMIC_RELEASE);
+    link_unlock();
 
     /*
      * Retorna `false` para informar a `_startTransfer` (`mgba/src/gba/sio.c` linha 145)
@@ -682,10 +758,12 @@ static void _link_driver_finish_multiplayer(struct GBASIODriver* driver, uint16_
         return;
     }
 
+    link_lock();
     _link_hub_latch_transfer_data(hub);
     for (int i = 0; i < LINK_MAX_PLAYERS; ++i) {
         data[i] = hub->multi_data[i];
     }
+    link_unlock();
 }
 
 static uint8_t _link_driver_finish_normal8(struct GBASIODriver* driver) {
@@ -695,8 +773,11 @@ static uint8_t _link_driver_finish_normal8(struct GBASIODriver* driver) {
         return 0xFFU;
     }
 
+    link_lock();
     _link_hub_latch_transfer_data(hub);
-    return (self->player_id == 0) ? hub->normal8_data[1] : hub->normal8_data[0];
+    uint8_t res = (self->player_id == 0) ? hub->normal8_data[1] : hub->normal8_data[0];
+    link_unlock();
+    return res;
 }
 
 static uint32_t _link_driver_finish_normal32(struct GBASIODriver* driver) {
@@ -706,22 +787,25 @@ static uint32_t _link_driver_finish_normal32(struct GBASIODriver* driver) {
         return 0xFFFFFFFFU;
     }
 
+    link_lock();
     _link_hub_latch_transfer_data(hub);
-    return (self->player_id == 0) ? hub->normal32_data[1] : hub->normal32_data[0];
+    uint32_t res = (self->player_id == 0) ? hub->normal32_data[1] : hub->normal32_data[0];
+    link_unlock();
+    return res;
 }
 
 /* --- Funções Públicas do Link Hub --- */
 
 /*
  * Equivalente direto ao `SIO_EV_TRANSFER_START` em `mgba/src/gba/sio/lockstep.c` (linhas 965-971):
- * Chamada por `emulator_step_lockstep_frame` assim que os Escravos (Players 1..3)
- * alcançam o ciclo exato em que o Mestre (Player 0) iniciou a transferência.
+ * Chamada por `emulator_step_lockstep_frame` na barreira quando todos os núcleos
+ * estão sincronizados após o início da transferência pelo Mestre (Player 0).
  * Ativa o bit Busy (0x80) nos Escravos (sem apagar `SIOMULTI0..3` anteriores!)
- * e agenda `transfer_event` no `mTiming` de cada Escravo para disparar no mesmo ciclo do Mestre.
+ * e agenda `transfer_event` no `mTiming` de cada Escravo para disparar no ciclo exato `finish_elapsed`.
  */
-void link_hub_begin_transfer_on_slaves(void) {
+void link_hub_begin_transfer_on_slaves(uint32_t master_elapsed, const uint32_t start_cycles[LINK_MAX_PLAYERS]) {
     PS4LinkHub* hub = &g_link_hub;
-    if (!hub->transfer_in_progress || !_link_hub_is_physically_linked(hub)) {
+    if (!__atomic_load_n(&hub->transfer_in_progress, __ATOMIC_ACQUIRE) || !_link_hub_is_physically_linked(hub)) {
         return;
     }
 
@@ -730,6 +814,26 @@ void link_hub_begin_transfer_on_slaves(void) {
         cycles = LINK_MIN_TRANSFER_CYCLES;
     }
 
+    uint32_t finish_elapsed = master_elapsed + (uint32_t)cycles;
+
+    for (int i = 1; i < hub->active_count; ++i) {
+        struct GBA* g = hub->gba[i];
+        if (!g) {
+            continue;
+        }
+        uint32_t slave_elapsed = (uint32_t)(mTimingCurrentTime(&g->timing) - start_cycles[i]);
+        if (slave_elapsed + 16U > finish_elapsed) {
+            finish_elapsed = slave_elapsed + 32U;
+        }
+    }
+
+    if (finish_elapsed > master_elapsed + (uint32_t)cycles && hub->gba[0]) {
+        int32_t master_rem = (int32_t)(finish_elapsed - master_elapsed);
+        mTimingDeschedule(&hub->gba[0]->timing, &hub->drivers[0].transfer_event);
+        mTimingSchedule(&hub->gba[0]->timing, &hub->drivers[0].transfer_event, master_rem);
+    }
+
+    hub->transfer_finish_elapsed = finish_elapsed;
     bool sd_ready = _link_hub_is_sd_ready(hub);
 
     for (int i = 0; i < hub->active_count; ++i) {
@@ -738,10 +842,18 @@ void link_hub_begin_transfer_on_slaves(void) {
         }
     }
 
+    uint32_t sched_mask = (1U << 0);
+
     for (int i = 1; i < hub->active_count; ++i) {
         struct GBA* g = hub->gba[i];
         if (!g) {
             continue;
+        }
+
+        uint32_t slave_elapsed = (uint32_t)(mTimingCurrentTime(&g->timing) - start_cycles[i]);
+        int32_t slave_cycles = (int32_t)(finish_elapsed - slave_elapsed);
+        if (slave_cycles < 16) {
+            slave_cycles = 16;
         }
 
         if (hub->transfer_mode == GBA_SIO_MULTI) {
@@ -765,15 +877,17 @@ void link_hub_begin_transfer_on_slaves(void) {
                 g->memory.io[GBA_REG(RCNT)] = g->sio.rcnt;
             }
 
-            hub->transfer_scheduled_mask |= (1U << i);
+            sched_mask |= (1U << i);
             mTimingDeschedule(&g->timing, &hub->drivers[i].transfer_event);
-            mTimingSchedule(&g->timing, &hub->drivers[i].transfer_event, cycles);
+            mTimingSchedule(&g->timing, &hub->drivers[i].transfer_event, slave_cycles);
         } else if ((hub->transfer_mode == GBA_SIO_NORMAL_8 || hub->transfer_mode == GBA_SIO_NORMAL_32) && i == 1) {
-            hub->transfer_scheduled_mask |= (1U << 1);
+            sched_mask |= (1U << 1);
             mTimingDeschedule(&g->timing, &hub->drivers[1].transfer_event);
-            mTimingSchedule(&g->timing, &hub->drivers[1].transfer_event, cycles);
+            mTimingSchedule(&g->timing, &hub->drivers[1].transfer_event, slave_cycles);
         }
     }
+
+    __atomic_store_n(&hub->transfer_scheduled_mask, sched_mask, __ATOMIC_RELEASE);
 }
 
 void link_hub_init(void) {
@@ -912,6 +1026,7 @@ bool link_hub_is_hotplugging(void) {
 }
 
 void link_hub_begin_frame(void) {
+    __atomic_store_n(&g_link_hub.slice_interrupt, false, __ATOMIC_RELEASE);
     if (g_link_hub.hotplug_disconnect_frames > 0) {
         g_link_hub.hotplug_disconnect_frames--;
         if (g_link_hub.hotplug_disconnect_frames == 0) {
@@ -962,18 +1077,14 @@ void link_hub_destroy(void) {
 }
 
 bool link_hub_is_transfer_active(void) {
-    if (g_link_hub.transfer_in_progress) {
+    if (__atomic_load_n(&g_link_hub.transfer_in_progress, __ATOMIC_ACQUIRE)) {
         return true;
     }
     return (__atomic_load_n(&g_link_hub.active_transfer_lines, __ATOMIC_ACQUIRE) > 0);
 }
 
 bool link_hub_consume_just_started(void) {
-    if (g_link_hub.transfer_just_started) {
-        g_link_hub.transfer_just_started = false;
-        return true;
-    }
-    return false;
+    return __atomic_exchange_n(&g_link_hub.transfer_just_started, false, __ATOMIC_ACQ_REL);
 }
 
 void link_hub_notify_scanline(void) {

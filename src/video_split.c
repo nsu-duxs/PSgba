@@ -3,6 +3,7 @@
 #include "ui_menu.h"
 #include <string.h>
 #include <time.h>
+#include <immintrin.h>
 #include <orbis/libkernel.h>
 #include <orbis/VideoOut.h>
 #include <orbis/UserService.h>
@@ -29,16 +30,16 @@ static bool s_prev_show_fps = true;
 static UIAppState s_prev_ui_state = UI_STATE_LAUNCHER;
 static PS4VideoResMode s_res_mode = PS4_RES_AUTO_HD;
 static PS4VideoResMode s_prev_res_mode = PS4_RES_AUTO_HD;
+static PS4FpsLimit s_fps_limit = PS4_FPS_60;
 static int s_fps_frame_count = 0;
 static uint64_t s_fps_last_us = 0;
 static int s_current_fps = 60;
 
-/* Internal high-resolution upscaling surfaces (1x: 240x160, 2x HD: 480x320, 4x UHD: 960x640) */
-static uint32_t s_buf_1x[GBA_SCREEN_WIDTH * GBA_SCREEN_HEIGHT];
-static uint32_t s_buf_2x[(GBA_SCREEN_WIDTH * 2) * (GBA_SCREEN_HEIGHT * 2)];
-static uint32_t s_buf_4x[(GBA_SCREEN_WIDTH * 4) * (GBA_SCREEN_HEIGHT * 4)];
-static uint32_t s_horiz_row_a[PS4_SCREEN_WIDTH];
-static uint32_t s_horiz_row_b[PS4_SCREEN_WIDTH];
+/* Per-instance 64-byte aligned surfaces so all 4 Jaguar cores scale video in parallel without false sharing */
+static uint32_t s_buf_1x[GBA_MAX_INSTANCES][GBA_SCREEN_WIDTH * GBA_SCREEN_HEIGHT] __attribute__((aligned(64)));
+static uint32_t s_buf_2x[GBA_MAX_INSTANCES][(GBA_SCREEN_WIDTH * 2) * (GBA_SCREEN_HEIGHT * 2)] __attribute__((aligned(64)));
+static uint32_t s_horiz_row_a[GBA_MAX_INSTANCES][PS4_SCREEN_WIDTH] __attribute__((aligned(64)));
+static uint32_t s_horiz_row_b[GBA_MAX_INSTANCES][PS4_SCREEN_WIDTH] __attribute__((aligned(64)));
 
 /*
  * Converts 2 packed mGBA 32-bit XBGR8 pixels (0x00BBGGRR_00BBGGRR)
@@ -60,22 +61,36 @@ static inline uint32_t blend_argb_75_25(uint32_t dom, uint32_t sub) {
     return blend_argb_50(dom, mid);
 }
 
+/*
+ * SSSE3 Vectorized XBGR8 -> ARGB8 Converter:
+ * Converts 8 pixels (32 bytes) per loop iteration using _mm_shuffle_epi8.
+ */
 static inline void convert_xbgr_to_argb_1x(
     const uint32_t* __restrict src_xbgr,
     uint32_t* __restrict dst_argb
 ) {
-    const uint64_t* __restrict s64 = (const uint64_t*)src_xbgr;
-    uint64_t* __restrict d64 = (uint64_t*)dst_argb;
-    const int pairs = (GBA_SCREEN_WIDTH * GBA_SCREEN_HEIGHT) / 2;
-    for (int i = 0; i < pairs; ++i) {
-        d64[i] = xbgr2_to_argb2(s64[i]);
+    const __m128i shuf_mask = _mm_setr_epi8(
+        2, 1, 0, -1,
+        6, 5, 4, -1,
+        10, 9, 8, -1,
+        14, 13, 12, -1
+    );
+    const __m128i alpha_mask = _mm_set1_epi32((int)0xFF000000U);
+    const int total_pixels = GBA_SCREEN_WIDTH * GBA_SCREEN_HEIGHT;
+
+    for (int i = 0; i < total_pixels; i += 8) {
+        __m128i v0 = _mm_loadu_si128((const __m128i*)&src_xbgr[i]);
+        __m128i v1 = _mm_loadu_si128((const __m128i*)&src_xbgr[i + 4]);
+        __m128i a0 = _mm_or_si128(_mm_shuffle_epi8(v0, shuf_mask), alpha_mask);
+        __m128i a1 = _mm_or_si128(_mm_shuffle_epi8(v1, shuf_mask), alpha_mask);
+        _mm_store_si128((__m128i*)&dst_argb[i], a0);
+        _mm_store_si128((__m128i*)&dst_argb[i + 4], a1);
     }
 }
 
 /*
- * HQ-EPX (Scale2x + Diagonal Subpixel Anti-Aliasing):
- * Doubles internal resolution (e.g. 240x160 -> 480x320, or 480x320 -> 960x640),
- * reconstructing diagonal edges and smoothing pixel steps while keeping text sharp.
+ * Branchless SIMD SSE2/SSE4.1 HQ-EPX (Scale2x + Diagonal Subpixel Anti-Aliasing):
+ * Processes 4 source pixels -> 16 destination pixels per iteration with ZERO conditional branches.
  */
 static void upscale_epx_aa_2x(
     const uint32_t* __restrict src,
@@ -84,6 +99,7 @@ static void upscale_epx_aa_2x(
     uint32_t* __restrict dst
 ) {
     const int dst_w = src_w * 2;
+    const __m128i all_ones = _mm_set1_epi32(-1);
 
     for (int y = 0; y < src_h; ++y) {
         const uint32_t* row_u = (y > 0) ? &src[(y - 1) * src_w] : &src[y * src_w];
@@ -93,33 +109,77 @@ static void upscale_epx_aa_2x(
         uint32_t* dst_r0 = &dst[(y * 2) * dst_w];
         uint32_t* dst_r1 = &dst[(y * 2 + 1) * dst_w];
 
-        for (int x = 0; x < src_w; ++x) {
+        /* Left border pixel (x = 0) */
+        {
+            uint32_t p = row_c[0];
+            uint32_t l = p;
+            uint32_t r = row_c[1];
+            uint32_t u = row_u[0];
+            uint32_t d = row_d[0];
+            uint32_t e0 = p, e1 = p, e2 = p, e3 = p;
+            if (l != r && u != d) {
+                if (l == u) e0 = blend_argb_75_25(u, p);
+                if (r == u) e1 = blend_argb_75_25(u, p);
+                if (l == d) e2 = blend_argb_75_25(d, p);
+                if (r == d) e3 = blend_argb_75_25(d, p);
+            }
+            dst_r0[0] = e0;
+            dst_r0[1] = e1;
+            dst_r1[0] = e2;
+            dst_r1[1] = e3;
+        }
+
+        /* Vectorized interior: 4 pixels per step */
+        int x = 1;
+        for (; x <= src_w - 5; x += 4) {
+            __m128i vp = _mm_loadu_si128((const __m128i*)&row_c[x]);
+            __m128i vl = _mm_loadu_si128((const __m128i*)&row_c[x - 1]);
+            __m128i vr = _mm_loadu_si128((const __m128i*)&row_c[x + 1]);
+            __m128i vu = _mm_loadu_si128((const __m128i*)&row_u[x]);
+            __m128i vd = _mm_loadu_si128((const __m128i*)&row_d[x]);
+
+            __m128i eq_lr = _mm_cmpeq_epi32(vl, vr);
+            __m128i eq_ud = _mm_cmpeq_epi32(vu, vd);
+            __m128i active = _mm_andnot_si128(_mm_or_si128(eq_lr, eq_ud), all_ones);
+
+            __m128i blend_up = _mm_avg_epu8(vu, _mm_avg_epu8(vu, vp));
+            __m128i blend_dp = _mm_avg_epu8(vd, _mm_avg_epu8(vd, vp));
+
+            __m128i m0 = _mm_and_si128(active, _mm_cmpeq_epi32(vl, vu));
+            __m128i m1 = _mm_and_si128(active, _mm_cmpeq_epi32(vr, vu));
+            __m128i m2 = _mm_and_si128(active, _mm_cmpeq_epi32(vl, vd));
+            __m128i m3 = _mm_and_si128(active, _mm_cmpeq_epi32(vr, vd));
+
+            __m128i e0 = _mm_blendv_epi8(vp, blend_up, m0);
+            __m128i e1 = _mm_blendv_epi8(vp, blend_up, m1);
+            __m128i e2 = _mm_blendv_epi8(vp, blend_dp, m2);
+            __m128i e3 = _mm_blendv_epi8(vp, blend_dp, m3);
+
+            __m128i r0_lo = _mm_unpacklo_epi32(e0, e1);
+            __m128i r0_hi = _mm_unpackhi_epi32(e0, e1);
+            __m128i r1_lo = _mm_unpacklo_epi32(e2, e3);
+            __m128i r1_hi = _mm_unpackhi_epi32(e2, e3);
+
+            _mm_storeu_si128((__m128i*)&dst_r0[x * 2 + 0], r0_lo);
+            _mm_storeu_si128((__m128i*)&dst_r0[x * 2 + 4], r0_hi);
+            _mm_storeu_si128((__m128i*)&dst_r1[x * 2 + 0], r1_lo);
+            _mm_storeu_si128((__m128i*)&dst_r1[x * 2 + 4], r1_hi);
+        }
+
+        /* Remaining right border pixels */
+        for (; x < src_w; ++x) {
             uint32_t p = row_c[x];
-            uint32_t l = (x > 0) ? row_c[x - 1] : p;
+            uint32_t l = row_c[x - 1];
             uint32_t r = (x + 1 < src_w) ? row_c[x + 1] : p;
             uint32_t u = row_u[x];
             uint32_t d = row_d[x];
-
-            uint32_t e0 = p;
-            uint32_t e1 = p;
-            uint32_t e2 = p;
-            uint32_t e3 = p;
-
+            uint32_t e0 = p, e1 = p, e2 = p, e3 = p;
             if (l != r && u != d) {
-                if (l == u) {
-                    e0 = blend_argb_75_25(u, p);
-                }
-                if (r == u) {
-                    e1 = blend_argb_75_25(u, p);
-                }
-                if (l == d) {
-                    e2 = blend_argb_75_25(d, p);
-                }
-                if (r == d) {
-                    e3 = blend_argb_75_25(d, p);
-                }
+                if (l == u) e0 = blend_argb_75_25(u, p);
+                if (r == u) e1 = blend_argb_75_25(u, p);
+                if (l == d) e2 = blend_argb_75_25(d, p);
+                if (r == d) e3 = blend_argb_75_25(d, p);
             }
-
             dst_r0[x * 2 + 0] = e0;
             dst_r0[x * 2 + 1] = e1;
             dst_r1[x * 2 + 0] = e2;
@@ -154,11 +214,11 @@ static inline void resample_row_subpixel(
 }
 
 /*
- * Fast 64-bit SWAR Subpixel Blitter from an HD upscaled surface (480x320 or 960x640)
+ * Fast 128-bit SIMD Subpixel Blitter from an HD upscaled surface (480x320)
  * to any target viewport on the 1080p PS4 framebuffer.
- * Horizontally resamples each unique source row at most once, then writes 64-bit pairs.
  */
 static void blit_hd_surface_wc64(
+    int slot_idx,
     uint32_t* __restrict dst_fb,
     const uint32_t* __restrict src_surf,
     int src_w,
@@ -168,13 +228,22 @@ static void blit_hd_surface_wc64(
     int dst_w,
     int dst_h
 ) {
+    uint32_t* __restrict horiz_a = s_horiz_row_a[slot_idx];
+    uint32_t* __restrict horiz_b = s_horiz_row_b[slot_idx];
+
     if (src_w == dst_w && src_h == dst_h) {
-        const int pairs = dst_w / 2;
         for (int y = 0; y < dst_h; ++y) {
-            const uint64_t* __restrict s64 = (const uint64_t*)&src_surf[y * src_w];
-            uint64_t* __restrict d64 = (uint64_t*)&dst_fb[(dst_y + y) * PS4_SCREEN_WIDTH + dst_x];
-            for (int i = 0; i < pairs; ++i) {
-                d64[i] = s64[i];
+            const uint32_t* __restrict s_row = &src_surf[y * src_w];
+            uint32_t* __restrict d_row = &dst_fb[(dst_y + y) * PS4_SCREEN_WIDTH + dst_x];
+            int x = 0;
+            for (; x <= dst_w - 8; x += 8) {
+                __m128i v0 = _mm_loadu_si128((const __m128i*)&s_row[x]);
+                __m128i v1 = _mm_loadu_si128((const __m128i*)&s_row[x + 4]);
+                _mm_storeu_si128((__m128i*)&d_row[x], v0);
+                _mm_storeu_si128((__m128i*)&d_row[x + 4], v1);
+            }
+            for (; x < dst_w; ++x) {
+                d_row[x] = s_row[x];
             }
         }
         return;
@@ -184,7 +253,6 @@ static void blit_hd_surface_wc64(
     uint32_t pos_y_fp = 0;
     int cached_sy_a = -1;
     int cached_sy_b = -1;
-    const int pairs = dst_w / 2;
 
     for (int dy = 0; dy < dst_h; ++dy) {
         int sy0 = (int)(pos_y_fp >> 16);
@@ -193,32 +261,43 @@ static void blit_hd_surface_wc64(
 
         if (sy0 != cached_sy_a) {
             if (sy0 == cached_sy_b) {
-                memcpy(s_horiz_row_a, s_horiz_row_b, (size_t)dst_w * sizeof(uint32_t));
+                memcpy(horiz_a, horiz_b, (size_t)dst_w * sizeof(uint32_t));
                 cached_sy_a = sy0;
             } else {
-                resample_row_subpixel(&src_surf[sy0 * src_w], src_w, s_horiz_row_a, dst_w);
+                resample_row_subpixel(&src_surf[sy0 * src_w], src_w, horiz_a, dst_w);
                 cached_sy_a = sy0;
             }
         }
 
-        uint64_t* __restrict d64 = (uint64_t*)&dst_fb[(dst_y + dy) * PS4_SCREEN_WIDTH + dst_x];
-        const uint64_t* __restrict ra64 = (const uint64_t*)s_horiz_row_a;
+        uint32_t* __restrict d_row = &dst_fb[(dst_y + dy) * PS4_SCREEN_WIDTH + dst_x];
 
         if (frac_y >= 2U && sy1 != sy0) {
             if (sy1 != cached_sy_b) {
-                resample_row_subpixel(&src_surf[sy1 * src_w], src_w, s_horiz_row_b, dst_w);
+                resample_row_subpixel(&src_surf[sy1 * src_w], src_w, horiz_b, dst_w);
                 cached_sy_b = sy1;
             }
-            const uint64_t* __restrict rb64 = (const uint64_t*)s_horiz_row_b;
-            for (int i = 0; i < pairs; ++i) {
-                uint64_t a = ra64[i];
-                uint64_t b = rb64[i];
-                d64[i] = 0xFF000000FF000000ULL |
-                         (((a & 0x00FEFEFE00FEFEFEULL) + (b & 0x00FEFEFE00FEFEFEULL)) >> 1);
+            int x = 0;
+            for (; x <= dst_w - 8; x += 8) {
+                __m128i a0 = _mm_load_si128((const __m128i*)&horiz_a[x]);
+                __m128i b0 = _mm_load_si128((const __m128i*)&horiz_b[x]);
+                __m128i a1 = _mm_load_si128((const __m128i*)&horiz_a[x + 4]);
+                __m128i b1 = _mm_load_si128((const __m128i*)&horiz_b[x + 4]);
+                _mm_storeu_si128((__m128i*)&d_row[x], _mm_avg_epu8(a0, b0));
+                _mm_storeu_si128((__m128i*)&d_row[x + 4], _mm_avg_epu8(a1, b1));
+            }
+            for (; x < dst_w; ++x) {
+                d_row[x] = blend_argb_50(horiz_a[x], horiz_b[x]);
             }
         } else {
-            for (int i = 0; i < pairs; ++i) {
-                d64[i] = ra64[i];
+            int x = 0;
+            for (; x <= dst_w - 8; x += 8) {
+                __m128i a0 = _mm_load_si128((const __m128i*)&horiz_a[x]);
+                __m128i a1 = _mm_load_si128((const __m128i*)&horiz_a[x + 4]);
+                _mm_storeu_si128((__m128i*)&d_row[x], a0);
+                _mm_storeu_si128((__m128i*)&d_row[x + 4], a1);
+            }
+            for (; x < dst_w; ++x) {
+                d_row[x] = horiz_a[x];
             }
         }
 
@@ -227,9 +306,50 @@ static void blit_hd_surface_wc64(
 }
 
 /*
+ * Fast 128-bit SIMD 2x scaler from an already EPX-AA anti-aliased 480x320 ARGB surface
+ * to 960x640 directly in Write-Combining destination framebuffer.
+ */
+static inline void blit_2x_from_argb_wc64(
+    uint32_t* __restrict dst_fb,
+    const uint32_t* __restrict src_argb,
+    int dst_x_start,
+    int dst_y_start
+) {
+    const uint32_t* src_row = src_argb;
+    uint32_t* dst_base = &dst_fb[dst_y_start * PS4_SCREEN_WIDTH + dst_x_start];
+
+    for (int sy = 0; sy < (GBA_SCREEN_HEIGHT * 2); ++sy) {
+        uint32_t* __restrict d0 = dst_base;
+        uint32_t* __restrict d1 = dst_base + PS4_SCREEN_WIDTH;
+
+        for (int sx = 0; sx < (GBA_SCREEN_WIDTH * 2); sx += 8) {
+            __m128i p0 = _mm_load_si128((const __m128i*)&src_row[sx]);
+            __m128i p1 = _mm_load_si128((const __m128i*)&src_row[sx + 4]);
+
+            __m128i w0 = _mm_unpacklo_epi32(p0, p0);
+            __m128i w1 = _mm_unpackhi_epi32(p0, p0);
+            __m128i w2 = _mm_unpacklo_epi32(p1, p1);
+            __m128i w3 = _mm_unpackhi_epi32(p1, p1);
+
+            _mm_storeu_si128((__m128i*)&d0[sx * 2 + 0], w0);
+            _mm_storeu_si128((__m128i*)&d0[sx * 2 + 4], w1);
+            _mm_storeu_si128((__m128i*)&d0[sx * 2 + 8], w2);
+            _mm_storeu_si128((__m128i*)&d0[sx * 2 + 12], w3);
+
+            _mm_storeu_si128((__m128i*)&d1[sx * 2 + 0], w0);
+            _mm_storeu_si128((__m128i*)&d1[sx * 2 + 4], w1);
+            _mm_storeu_si128((__m128i*)&d1[sx * 2 + 8], w2);
+            _mm_storeu_si128((__m128i*)&d1[sx * 2 + 12], w3);
+        }
+
+        src_row += (GBA_SCREEN_WIDTH * 2);
+        dst_base += PS4_SCREEN_WIDTH * 2;
+    }
+}
+
+/*
  * Fast 3x nearest-neighbor scaler (240x160 -> 720x480)
- * Packs 4 source pixels (p0..p3) into 6x uint64_t (12 pixels) per unrolled iteration,
- * writing directly to all 3 destination rows without reading back from Write-Combining memory.
+ * Packs 4 source pixels (p0..p3) into 3x 128-bit SSE registers (12 pixels) per iteration.
  */
 static inline void blit_3x_wc64(
     uint32_t* __restrict dst_fb,
@@ -237,44 +357,45 @@ static inline void blit_3x_wc64(
     int dst_x_start,
     int dst_y_start
 ) {
+    const __m128i shuf_xbgr = _mm_setr_epi8(
+        2, 1, 0, -1, 6, 5, 4, -1, 10, 9, 8, -1, 14, 13, 12, -1
+    );
+    const __m128i alpha_mask = _mm_set1_epi32((int)0xFF000000U);
+    const __m128i shuf_w0 = _mm_setr_epi8(0,1,2,3, 0,1,2,3, 0,1,2,3, 4,5,6,7);
+    const __m128i shuf_w1 = _mm_setr_epi8(4,5,6,7, 4,5,6,7, 8,9,10,11, 8,9,10,11);
+    const __m128i shuf_w2 = _mm_setr_epi8(8,9,10,11, 12,13,14,15, 12,13,14,15, 12,13,14,15);
+
     const uint32_t* src_row = src_buf;
     uint32_t* dst_base = &dst_fb[dst_y_start * PS4_SCREEN_WIDTH + dst_x_start];
 
     for (int sy = 0; sy < GBA_SCREEN_HEIGHT; ++sy) {
-        uint64_t* __restrict d0 = (uint64_t*)(dst_base);
-        uint64_t* __restrict d1 = (uint64_t*)(dst_base + PS4_SCREEN_WIDTH);
-        uint64_t* __restrict d2 = (uint64_t*)(dst_base + PS4_SCREEN_WIDTH * 2);
+        uint32_t* __restrict d0 = dst_base;
+        uint32_t* __restrict d1 = dst_base + PS4_SCREEN_WIDTH;
+        uint32_t* __restrict d2 = dst_base + PS4_SCREEN_WIDTH * 2;
 
-        const uint64_t* __restrict s64 = (const uint64_t*)src_row;
-        for (int i = 0; i < (GBA_SCREEN_WIDTH / 4); ++i) {
-            uint64_t p01 = xbgr2_to_argb2(s64[0]);
-            uint64_t p23 = xbgr2_to_argb2(s64[1]);
-            s64 += 2;
+        for (int sx = 0; sx < GBA_SCREEN_WIDTH; sx += 4) {
+            __m128i raw = _mm_loadu_si128((const __m128i*)&src_row[sx]);
+            __m128i p = _mm_or_si128(_mm_shuffle_epi8(raw, shuf_xbgr), alpha_mask);
 
-            uint64_t p0 = (uint32_t)p01;
-            uint64_t p1 = p01 >> 32;
-            uint64_t p2 = (uint32_t)p23;
-            uint64_t p3 = p23 >> 32;
+            __m128i w0 = _mm_shuffle_epi8(p, shuf_w0);
+            __m128i w1 = _mm_shuffle_epi8(p, shuf_w1);
+            __m128i w2 = _mm_shuffle_epi8(p, shuf_w2);
 
-            uint64_t w0 = (p0 << 32) | p0;
-            uint64_t w1 = (p1 << 32) | p0;
-            uint64_t w2 = (p1 << 32) | p1;
-            uint64_t w3 = (p2 << 32) | p2;
-            uint64_t w4 = (p3 << 32) | p2;
-            uint64_t w5 = (p3 << 32) | p3;
+            _mm_storeu_si128((__m128i*)&d0[0], w0);
+            _mm_storeu_si128((__m128i*)&d0[4], w1);
+            _mm_storeu_si128((__m128i*)&d0[8], w2);
 
-            d0[0] = w0; d0[1] = w1; d0[2] = w2;
-            d0[3] = w3; d0[4] = w4; d0[5] = w5;
+            _mm_storeu_si128((__m128i*)&d1[0], w0);
+            _mm_storeu_si128((__m128i*)&d1[4], w1);
+            _mm_storeu_si128((__m128i*)&d1[8], w2);
 
-            d1[0] = w0; d1[1] = w1; d1[2] = w2;
-            d1[3] = w3; d1[4] = w4; d1[5] = w5;
+            _mm_storeu_si128((__m128i*)&d2[0], w0);
+            _mm_storeu_si128((__m128i*)&d2[4], w1);
+            _mm_storeu_si128((__m128i*)&d2[8], w2);
 
-            d2[0] = w0; d2[1] = w1; d2[2] = w2;
-            d2[3] = w3; d2[4] = w4; d2[5] = w5;
-
-            d0 += 6;
-            d1 += 6;
-            d2 += 6;
+            d0 += 12;
+            d1 += 12;
+            d2 += 12;
         }
 
         src_row += GBA_SCREEN_WIDTH;
@@ -283,8 +404,8 @@ static inline void blit_3x_wc64(
 }
 
 /*
- * Fast 4x nearest-neighbor scaler (240x160 -> 960x640)
- * Packs 4 source pixels into 8x uint64_t (16 pixels) per unrolled iteration.
+ * Fast 128-bit SIMD 4x nearest-neighbor scaler (240x160 -> 960x640)
+ * Packs 4 source pixels into 4x 128-bit SSE registers (16 pixels) per iteration.
  */
 static inline void blit_4x_wc64(
     uint32_t* __restrict dst_fb,
@@ -292,47 +413,53 @@ static inline void blit_4x_wc64(
     int dst_x_start,
     int dst_y_start
 ) {
+    const __m128i shuf_xbgr = _mm_setr_epi8(
+        2, 1, 0, -1, 6, 5, 4, -1, 10, 9, 8, -1, 14, 13, 12, -1
+    );
+    const __m128i alpha_mask = _mm_set1_epi32((int)0xFF000000U);
+
     const uint32_t* src_row = src_buf;
     uint32_t* dst_base = &dst_fb[dst_y_start * PS4_SCREEN_WIDTH + dst_x_start];
 
     for (int sy = 0; sy < GBA_SCREEN_HEIGHT; ++sy) {
-        uint64_t* __restrict d0 = (uint64_t*)(dst_base);
-        uint64_t* __restrict d1 = (uint64_t*)(dst_base + PS4_SCREEN_WIDTH);
-        uint64_t* __restrict d2 = (uint64_t*)(dst_base + PS4_SCREEN_WIDTH * 2);
-        uint64_t* __restrict d3 = (uint64_t*)(dst_base + PS4_SCREEN_WIDTH * 3);
+        uint32_t* __restrict d0 = dst_base;
+        uint32_t* __restrict d1 = dst_base + PS4_SCREEN_WIDTH;
+        uint32_t* __restrict d2 = dst_base + PS4_SCREEN_WIDTH * 2;
+        uint32_t* __restrict d3 = dst_base + PS4_SCREEN_WIDTH * 3;
 
-        const uint64_t* __restrict s64 = (const uint64_t*)src_row;
-        for (int i = 0; i < (GBA_SCREEN_WIDTH / 4); ++i) {
-            uint64_t p01 = xbgr2_to_argb2(s64[0]);
-            uint64_t p23 = xbgr2_to_argb2(s64[1]);
-            s64 += 2;
+        for (int sx = 0; sx < GBA_SCREEN_WIDTH; sx += 4) {
+            __m128i raw = _mm_loadu_si128((const __m128i*)&src_row[sx]);
+            __m128i p = _mm_or_si128(_mm_shuffle_epi8(raw, shuf_xbgr), alpha_mask);
 
-            uint64_t p0 = (uint32_t)p01;
-            uint64_t p1 = p01 >> 32;
-            uint64_t p2 = (uint32_t)p23;
-            uint64_t p3 = p23 >> 32;
+            __m128i w0 = _mm_shuffle_epi32(p, _MM_SHUFFLE(0, 0, 0, 0));
+            __m128i w1 = _mm_shuffle_epi32(p, _MM_SHUFFLE(1, 1, 1, 1));
+            __m128i w2 = _mm_shuffle_epi32(p, _MM_SHUFFLE(2, 2, 2, 2));
+            __m128i w3 = _mm_shuffle_epi32(p, _MM_SHUFFLE(3, 3, 3, 3));
 
-            uint64_t w0 = (p0 << 32) | p0;
-            uint64_t w1 = (p1 << 32) | p1;
-            uint64_t w2 = (p2 << 32) | p2;
-            uint64_t w3 = (p3 << 32) | p3;
+            _mm_storeu_si128((__m128i*)&d0[0], w0);
+            _mm_storeu_si128((__m128i*)&d0[4], w1);
+            _mm_storeu_si128((__m128i*)&d0[8], w2);
+            _mm_storeu_si128((__m128i*)&d0[12], w3);
 
-            d0[0] = w0; d0[1] = w0; d0[2] = w1; d0[3] = w1;
-            d0[4] = w2; d0[5] = w2; d0[6] = w3; d0[7] = w3;
+            _mm_storeu_si128((__m128i*)&d1[0], w0);
+            _mm_storeu_si128((__m128i*)&d1[4], w1);
+            _mm_storeu_si128((__m128i*)&d1[8], w2);
+            _mm_storeu_si128((__m128i*)&d1[12], w3);
 
-            d1[0] = w0; d1[1] = w0; d1[2] = w1; d1[3] = w1;
-            d1[4] = w2; d1[5] = w2; d1[6] = w3; d1[7] = w3;
+            _mm_storeu_si128((__m128i*)&d2[0], w0);
+            _mm_storeu_si128((__m128i*)&d2[4], w1);
+            _mm_storeu_si128((__m128i*)&d2[8], w2);
+            _mm_storeu_si128((__m128i*)&d2[12], w3);
 
-            d2[0] = w0; d2[1] = w0; d2[2] = w1; d2[3] = w1;
-            d2[4] = w2; d2[5] = w2; d2[6] = w3; d2[7] = w3;
+            _mm_storeu_si128((__m128i*)&d3[0], w0);
+            _mm_storeu_si128((__m128i*)&d3[4], w1);
+            _mm_storeu_si128((__m128i*)&d3[8], w2);
+            _mm_storeu_si128((__m128i*)&d3[12], w3);
 
-            d3[0] = w0; d3[1] = w0; d3[2] = w1; d3[3] = w1;
-            d3[4] = w2; d3[5] = w2; d3[6] = w3; d3[7] = w3;
-
-            d0 += 8;
-            d1 += 8;
-            d2 += 8;
-            d3 += 8;
+            d0 += 16;
+            d1 += 16;
+            d2 += 16;
+            d3 += 16;
         }
 
         src_row += GBA_SCREEN_WIDTH;
@@ -546,14 +673,37 @@ bool video_init(void) {
         return false;
     }
 
-    /* Flip rate: 0 = 60Hz */
-    sceVideoOutSetFlipRate(s_video_handle, 0);
+    /* Flip rate: 0 = 60Hz, 1 = 30Hz */
+    sceVideoOutSetFlipRate(s_video_handle, (s_fps_limit == PS4_FPS_30) ? 1 : 0);
 
     s_buffer_index = 0;
     s_flip_arg = 1;
     s_submitted_flip_arg = 0;
     s_clear_frames_remaining = NUM_FRAMEBUFFERS;
     return true;
+}
+
+void video_set_fps_limit(PS4FpsLimit limit) {
+    if (limit >= 0 && limit < PS4_FPS_LIMIT_COUNT) {
+        s_fps_limit = limit;
+        if (s_video_handle >= 0) {
+            /* 0 = 60Hz, 1 = 30Hz */
+            sceVideoOutSetFlipRate(s_video_handle, (limit == PS4_FPS_30) ? 1 : 0);
+        }
+        s_clear_frames_remaining = NUM_FRAMEBUFFERS;
+    }
+}
+
+PS4FpsLimit video_get_fps_limit(void) {
+    return s_fps_limit;
+}
+
+void video_toggle_fps_limit(void) {
+    video_set_fps_limit((s_fps_limit == PS4_FPS_60) ? PS4_FPS_30 : PS4_FPS_60);
+}
+
+const char* video_get_fps_limit_name(PS4FpsLimit limit) {
+    return (limit == PS4_FPS_30) ? "30 FPS" : "60 FPS";
 }
 
 void video_set_res_mode(PS4VideoResMode mode) {
@@ -592,6 +742,7 @@ const char* video_get_res_mode_name(PS4VideoResMode mode) {
 }
 
 static void render_instance_hd(
+    int slot_idx,
     uint32_t* __restrict back_buffer,
     const uint32_t* __restrict src_xbgr,
     int internal_scale, /* 2 = 480x320, 4 = 960x640 */
@@ -600,18 +751,115 @@ static void render_instance_hd(
     int dst_w,
     int dst_h
 ) {
-    convert_xbgr_to_argb_1x(src_xbgr, s_buf_1x);
-    upscale_epx_aa_2x(s_buf_1x, GBA_SCREEN_WIDTH, GBA_SCREEN_HEIGHT, s_buf_2x);
+    (void)internal_scale;
+    uint32_t* __restrict buf_1x = s_buf_1x[slot_idx];
+    uint32_t* __restrict buf_2x = s_buf_2x[slot_idx];
 
-    if (internal_scale >= 4) {
-        upscale_epx_aa_2x(s_buf_2x, GBA_SCREEN_WIDTH * 2, GBA_SCREEN_HEIGHT * 2, s_buf_4x);
-        blit_hd_surface_wc64(back_buffer, s_buf_4x,
-                             GBA_SCREEN_WIDTH * 4, GBA_SCREEN_HEIGHT * 4,
-                             dst_x, dst_y, dst_w, dst_h);
+    convert_xbgr_to_argb_1x(src_xbgr, buf_1x);
+    upscale_epx_aa_2x(buf_1x, GBA_SCREEN_WIDTH, GBA_SCREEN_HEIGHT, buf_2x);
+
+    if (dst_w == (GBA_SCREEN_WIDTH * 4) && dst_h == (GBA_SCREEN_HEIGHT * 4)) {
+        blit_2x_from_argb_wc64(back_buffer, buf_2x, dst_x, dst_y);
     } else {
-        blit_hd_surface_wc64(back_buffer, s_buf_2x,
+        blit_hd_surface_wc64(slot_idx, back_buffer, buf_2x,
                              GBA_SCREEN_WIDTH * 2, GBA_SCREEN_HEIGHT * 2,
                              dst_x, dst_y, dst_w, dst_h);
+    }
+}
+
+void video_render_instance_slot(int slot_idx, uint32_t* back_buffer, struct PS4GBA_Context* ctx) {
+    if (!back_buffer || !ctx || slot_idx < 0 || slot_idx >= GBA_MAX_INSTANCES) {
+        return;
+    }
+    if (!ctx->instances[slot_idx].active || !ctx->instances[slot_idx].video_buffer) {
+        return;
+    }
+
+    static const uint32_t player_colors[GBA_MAX_INSTANCES] = {
+        0xFF0066FFU, /* P1: Azul (Controle 1) */
+        0xFFFF1744U, /* P2: Vermelho (Controle 2) */
+        0xFF00E676U, /* P3: Verde (Controle 3) */
+        0xFFFF1493U  /* P4: Rosa (Controle 4) */
+    };
+
+    int active_count = ctx->active_count;
+    int audio_focus = audio_get_focus_player();
+    bool focus_highlight = (audio_get_mode() == PS4_AUDIO_MODE_FOCUS);
+    int border_thick = (focus_highlight && audio_focus == slot_idx) ? 4 : 2;
+    const uint32_t* src_buf = ctx->instances[slot_idx].video_buffer;
+
+    if (s_res_mode == PS4_RES_1X_NATIVE) {
+        if (active_count == 1) {
+            blit_6x_wc64(back_buffer, src_buf, 240, 60);
+            draw_viewport_border(back_buffer, 240, 60, 1440, 960, border_thick, player_colors[slot_idx]);
+        } else if (active_count == 2) {
+            int view_idx = 0;
+            for (int i = 0; i < slot_idx; ++i) {
+                if (ctx->instances[i].active && ctx->instances[i].video_buffer) {
+                    view_idx++;
+                }
+            }
+            if (view_idx < 2) {
+                int vx = (view_idx == 0) ? 0 : 960;
+                blit_4x_wc64(back_buffer, src_buf, vx, 220);
+                draw_viewport_border(back_buffer, vx, 220, 960, 640, border_thick, player_colors[slot_idx]);
+            }
+        } else {
+            static const struct {
+                int x;
+                int y;
+            } quadrant_origins[GBA_MAX_INSTANCES] = {
+                { 120,  30 },
+                { 1080, 30 },
+                { 120,  570 },
+                { 1080, 570 }
+            };
+            blit_3x_wc64(back_buffer, src_buf,
+                         quadrant_origins[slot_idx].x, quadrant_origins[slot_idx].y);
+            draw_viewport_border(back_buffer,
+                                 quadrant_origins[slot_idx].x, quadrant_origins[slot_idx].y,
+                                 720, 480, border_thick, player_colors[slot_idx]);
+        }
+    } else {
+        bool full_16_9 = (s_res_mode == PS4_RES_FULL_16_9);
+
+        if (active_count == 1) {
+            int internal_scale = (s_res_mode == PS4_RES_2X_HD) ? 2 : 4;
+            int dst_w = full_16_9 ? 1920 : 1620;
+            int dst_h = 1080;
+            int dst_x = (PS4_SCREEN_WIDTH - dst_w) / 2;
+            render_instance_hd(slot_idx, back_buffer, src_buf,
+                               internal_scale, dst_x, 0, dst_w, dst_h);
+            draw_viewport_border(back_buffer, dst_x, 0, dst_w, dst_h, border_thick, player_colors[slot_idx]);
+        } else if (active_count == 2) {
+            int view_idx = 0;
+            for (int i = 0; i < slot_idx; ++i) {
+                if (ctx->instances[i].active && ctx->instances[i].video_buffer) {
+                    view_idx++;
+                }
+            }
+            if (view_idx < 2) {
+                int internal_scale = (s_res_mode == PS4_RES_2X_HD) ? 2 : 4;
+                int dst_w = 960;
+                int dst_h = full_16_9 ? 720 : 640;
+                int dst_y = (PS4_SCREEN_HEIGHT - dst_h) / 2;
+                int vx = (view_idx == 0) ? 0 : 960;
+                render_instance_hd(slot_idx, back_buffer, src_buf,
+                                   internal_scale, vx, dst_y, dst_w, dst_h);
+                draw_viewport_border(back_buffer, vx, dst_y, dst_w, dst_h, border_thick, player_colors[slot_idx]);
+            }
+        } else {
+            int internal_scale = (s_res_mode == PS4_RES_4X_UHD) ? 4 : 2;
+            int dst_w = full_16_9 ? 960 : 804;
+            int dst_h = full_16_9 ? 540 : 532;
+            int pad_x = (960 - dst_w) / 2;
+            int pad_y = (540 - dst_h) / 2;
+            int qx = ((slot_idx & 1) ? 960 : 0) + pad_x;
+            int qy = ((slot_idx >= 2) ? 540 : 0) + pad_y;
+            render_instance_hd(slot_idx, back_buffer, src_buf,
+                               internal_scale, qx, qy, dst_w, dst_h);
+            draw_viewport_border(back_buffer, qx, qy, dst_w, dst_h, border_thick, player_colors[slot_idx]);
+        }
     }
 }
 
@@ -696,111 +944,8 @@ void video_render_split_screen(struct PS4GBA_Context* ctx) {
         }
     }
 
-    /* Cores correspondentes aos 4 controles DualShock 4 (P1: Azul, P2: Vermelho, P3: Verde, P4: Rosa) */
-    static const uint32_t player_colors[GBA_MAX_INSTANCES] = {
-        0xFF0066FFU, /* P1: Azul (Controle 1) */
-        0xFFFF1744U, /* P2: Vermelho (Controle 2) */
-        0xFF00E676U, /* P3: Verde (Controle 3) */
-        0xFFFF1493U  /* P4: Rosa (Controle 4) */
-    };
-
-    if (s_res_mode == PS4_RES_1X_NATIVE) {
-        if (active_count == 1) {
-            if (ctx->instances[0].active && ctx->instances[0].video_buffer) {
-                blit_6x_wc64(back_buffer, ctx->instances[0].video_buffer, 240, 60);
-                int border_thick = (focus_highlight && audio_focus == 0) ? 4 : 2;
-                draw_viewport_border(back_buffer, 240, 60, 1440, 960, border_thick, player_colors[0]);
-            }
-        } else if (active_count == 2) {
-            static const int p2_x[2] = { 0, 960 };
-            int view_idx = 0;
-            for (int i = 0; i < GBA_MAX_INSTANCES && view_idx < 2; ++i) {
-                if (ctx->instances[i].active && ctx->instances[i].video_buffer) {
-                    blit_4x_wc64(back_buffer, ctx->instances[i].video_buffer, p2_x[view_idx], 220);
-                    int border_thick = (focus_highlight && audio_focus == i) ? 4 : 2;
-                    draw_viewport_border(back_buffer, p2_x[view_idx], 220, 960, 640, border_thick, player_colors[i]);
-                    view_idx++;
-                }
-            }
-        } else {
-            static const struct {
-                int x;
-                int y;
-            } quadrant_origins[GBA_MAX_INSTANCES] = {
-                { 120,  30 },
-                { 1080, 30 },
-                { 120,  570 },
-                { 1080, 570 }
-            };
-            for (int i = 0; i < GBA_MAX_INSTANCES; ++i) {
-                if (ctx && ctx->instances[i].active && ctx->instances[i].video_buffer) {
-                    blit_3x_wc64(back_buffer, ctx->instances[i].video_buffer,
-                                 quadrant_origins[i].x, quadrant_origins[i].y);
-                    int border_thick = (focus_highlight && audio_focus == i) ? 4 : 2;
-                    draw_viewport_border(back_buffer,
-                                         quadrant_origins[i].x, quadrant_origins[i].y,
-                                         720, 480, border_thick, player_colors[i]);
-                }
-            }
-        }
-    } else {
-        bool full_16_9 = (s_res_mode == PS4_RES_FULL_16_9);
-
-        if (active_count == 1) {
-            /* 1P: 4x Ultra HD (960x640 internal) -> 1620x1080 (3:2 Max HD) or 1920x1080 (16:9 Full) */
-            int internal_scale = (s_res_mode == PS4_RES_2X_HD) ? 2 : 4;
-            int dst_w = full_16_9 ? 1920 : 1620;
-            int dst_h = 1080;
-            int dst_x = (PS4_SCREEN_WIDTH - dst_w) / 2;
-            if (ctx->instances[0].active && ctx->instances[0].video_buffer) {
-                render_instance_hd(back_buffer, ctx->instances[0].video_buffer,
-                                   internal_scale, dst_x, 0, dst_w, dst_h);
-                int border_thick = (focus_highlight && audio_focus == 0) ? 4 : 2;
-                draw_viewport_border(back_buffer, dst_x, 0, dst_w, dst_h, border_thick, player_colors[0]);
-            }
-        } else if (active_count == 2) {
-            /* 2P: 4x Ultra HD (960x640 internal) -> 960x640 (3:2) or 960x720 (16:9) */
-            int internal_scale = (s_res_mode == PS4_RES_2X_HD) ? 2 : 4;
-            int dst_w = 960;
-            int dst_h = full_16_9 ? 720 : 640;
-            int dst_y = (PS4_SCREEN_HEIGHT - dst_h) / 2;
-            static const int p2_x[2] = { 0, 960 };
-            int view_idx = 0;
-            for (int i = 0; i < GBA_MAX_INSTANCES && view_idx < 2; ++i) {
-                if (ctx->instances[i].active && ctx->instances[i].video_buffer) {
-                    render_instance_hd(back_buffer, ctx->instances[i].video_buffer,
-                                       internal_scale, p2_x[view_idx], dst_y, dst_w, dst_h);
-                    int border_thick = (focus_highlight && audio_focus == i) ? 4 : 2;
-                    draw_viewport_border(back_buffer, p2_x[view_idx], dst_y, dst_w, dst_h, border_thick, player_colors[i]);
-                    view_idx++;
-                }
-            }
-        } else {
-            /* 3P/4P: 2x HD (480x320) or 4x UHD -> 804x532 (3:2 Max) or 960x540 (16:9 Full Quadrant) */
-            int internal_scale = (s_res_mode == PS4_RES_4X_UHD) ? 4 : 2;
-            int dst_w = full_16_9 ? 960 : 804;
-            int dst_h = full_16_9 ? 540 : 532;
-            int pad_x = (960 - dst_w) / 2;
-            int pad_y = (540 - dst_h) / 2;
-            const int quad_x[GBA_MAX_INSTANCES] = {
-                pad_x, 960 + pad_x, pad_x, 960 + pad_x
-            };
-            const int quad_y[GBA_MAX_INSTANCES] = {
-                pad_y, pad_y, 540 + pad_y, 540 + pad_y
-            };
-
-            for (int i = 0; i < GBA_MAX_INSTANCES; ++i) {
-                if (ctx && ctx->instances[i].active && ctx->instances[i].video_buffer) {
-                    render_instance_hd(back_buffer, ctx->instances[i].video_buffer,
-                                       internal_scale, quad_x[i], quad_y[i], dst_w, dst_h);
-                    int border_thick = (focus_highlight && audio_focus == i) ? 4 : 2;
-                    draw_viewport_border(back_buffer,
-                                         quad_x[i], quad_y[i],
-                                         dst_w, dst_h, border_thick, player_colors[i]);
-                }
-            }
-        }
-    }
+    /* Renderiza os viewports de todas as instâncias ativas em paralelo nos 4 núcleos Jaguar */
+    emulator_parallel_render_video(back_buffer, ctx);
 
     if (show_fps) {
         ui_menu_render_fps_overlay(back_buffer, s_current_fps);

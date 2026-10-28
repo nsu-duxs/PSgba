@@ -13,7 +13,7 @@
 #include <sys/stat.h>
 #include <orbis/Pad.h>
 
-#define LAUNCHER_ROM_START_IDX 2
+#define LAUNCHER_ROM_START_IDX 3
 
 enum {
     OSD_ITEM_RESUME = 0,
@@ -21,6 +21,7 @@ enum {
     OSD_ITEM_LINK_HOTPLUG,
     OSD_ITEM_VIDEO_RES,
     OSD_ITEM_SHOW_FPS,
+    OSD_ITEM_FPS_LIMIT,
     OSD_ITEM_AUDIO_FOCUS,
     OSD_ITEM_QUICK_SAVE,
     OSD_ITEM_QUICK_LOAD,
@@ -464,6 +465,10 @@ void ui_menu_update_launcher(struct PS4GBA_Context* ctx, uint32_t buttons_presse
         if (buttons_pressed & (ORBIS_PAD_BUTTON_LEFT | ORBIS_PAD_BUTTON_RIGHT | ORBIS_PAD_BUTTON_CROSS)) {
             s_show_fps = !s_show_fps;
         }
+    } else if (s_launcher_cursor == 2) {
+        if (buttons_pressed & (ORBIS_PAD_BUTTON_LEFT | ORBIS_PAD_BUTTON_RIGHT | ORBIS_PAD_BUTTON_CROSS)) {
+            video_toggle_fps_limit();
+        }
     } else if (s_launcher_cursor >= LAUNCHER_ROM_START_IDX) {
         if (buttons_pressed & ORBIS_PAD_BUTTON_CROSS) {
             int rom_idx = s_launcher_cursor - LAUNCHER_ROM_START_IDX;
@@ -518,6 +523,14 @@ void ui_menu_update_osd(struct PS4GBA_Context* ctx, uint32_t buttons_pressed) {
     if (s_osd_cursor == OSD_ITEM_SHOW_FPS &&
         (buttons_pressed & (ORBIS_PAD_BUTTON_LEFT | ORBIS_PAD_BUTTON_RIGHT | ORBIS_PAD_BUTTON_CROSS))) {
         s_show_fps = !s_show_fps;
+        return;
+    }
+
+    if (s_osd_cursor == OSD_ITEM_FPS_LIMIT &&
+        (buttons_pressed & (ORBIS_PAD_BUTTON_LEFT | ORBIS_PAD_BUTTON_RIGHT | ORBIS_PAD_BUTTON_CROSS))) {
+        video_toggle_fps_limit();
+        snprintf(s_osd_status, sizeof(s_osd_status), "Bloqueio de FPS: %s",
+                 video_get_fps_limit_name(video_get_fps_limit()));
         return;
     }
 
@@ -613,11 +626,17 @@ void ui_menu_render_launcher(uint32_t* fb) {
     ui_draw_text(fb, 120, 180, line_buf,
                  (s_launcher_cursor == 1) ? 0xFF00F5D4U : 0xFFCCCCCCU, 2);
 
+    snprintf(line_buf, sizeof(line_buf), "%s Bloqueio de FPS: < %s >",
+             (s_launcher_cursor == 2) ? ">" : " ",
+             video_get_fps_limit_name(video_get_fps_limit()));
+    ui_draw_text(fb, 120, 218, line_buf,
+                 (s_launcher_cursor == 2) ? 0xFF00F5D4U : 0xFFCCCCCCU, 2);
+
     snprintf(line_buf, sizeof(line_buf),
              "ROMS disponiveis (%d encontradas - [TRIANGULO] Recarregar USB):", s_rom_count);
-    ui_draw_text(fb, 120, 234, line_buf, 0xFFFFBE0BU, 2);
+    ui_draw_text(fb, 120, 260, line_buf, 0xFFFFBE0BU, 2);
 
-    int max_visible = 16;
+    int max_visible = 15;
     int selected_rom = (s_launcher_cursor >= LAUNCHER_ROM_START_IDX)
                            ? (s_launcher_cursor - LAUNCHER_ROM_START_IDX)
                            : 0;
@@ -632,7 +651,7 @@ void ui_menu_render_launcher(uint32_t* fb) {
                  is_sel ? "->" : "  ", idx + 1, s_rom_files[idx]);
 
         uint32_t text_color = is_sel ? 0xFF00F5D4U : (is_usb ? 0xFF64DFDFU : 0xFFCBD5E1U);
-        ui_draw_text(fb, 140, 276 + i * 36, line_buf, text_color, 2);
+        ui_draw_text(fb, 140, 298 + i * 36, line_buf, text_color, 2);
     }
 
     /* Informacoes de status do USB e varredura */
@@ -680,6 +699,10 @@ void ui_menu_render_osd(uint32_t* fb, struct PS4GBA_Context* ctx) {
     snprintf(item_fps, sizeof(item_fps), "Contador de FPS na Tela: < %s >",
              s_show_fps ? "Ligado" : "Desligado");
 
+    char item_fps_limit[96];
+    snprintf(item_fps_limit, sizeof(item_fps_limit), "Bloqueio de FPS: < %s >",
+             video_get_fps_limit_name(video_get_fps_limit()));
+
     char focus_label[64];
     if (audio_get_mode() == PS4_AUDIO_MODE_MIX) {
         snprintf(focus_label, sizeof(focus_label), "Modo Mix (Todas 25%%)");
@@ -703,6 +726,7 @@ void ui_menu_render_osd(uint32_t* fb, struct PS4GBA_Context* ctx) {
         "Conectar / Reconectar Link Cable (Simular Hotplug)",
         item_res,
         item_fps,
+        item_fps_limit,
         item_audio,
         item_qsave,
         item_qload,
