@@ -22,11 +22,12 @@ static uint32_t s_start_cycles[GBA_MAX_INSTANCES] __attribute__((aligned(64)));
 
 static uint32_t* s_video_back_buffer = NULL;
 static struct PS4GBA_Context* s_video_ctx = NULL;
+static int s_video_band_slot = 0;
 
 typedef struct __attribute__((aligned(64))) GBAWorker {
     OrbisPthread thread;
     int player_id;
-    volatile int command; /* 0 = idle, 1 = step_slice, 2 = finish_frame, 3 = terminate, 4 = render_video */
+    volatile int command; /* 0 = idle, 1 = step_slice, 2 = finish_frame, 3 = terminate, 4 = render_video, 5 = render_band (1P) */
     volatile uint32_t target_slice;
     volatile bool running;
     bool thread_created;
@@ -286,6 +287,10 @@ static void* worker_thread_main(void* arg) {
         } else if (cmd == 4) {
             video_render_instance_slot(idx, s_video_back_buffer, s_video_ctx);
             __atomic_store_n(&w->command, 0, __ATOMIC_RELEASE);
+        } else if (cmd == 5) {
+            video_render_instance_band(s_video_band_slot, idx, GBA_MAX_INSTANCES,
+                                       s_video_back_buffer, s_video_ctx);
+            __atomic_store_n(&w->command, 0, __ATOMIC_RELEASE);
         }
     }
     return NULL;
@@ -359,11 +364,43 @@ void emulator_parallel_render_video(uint32_t* back_buffer, struct PS4GBA_Context
         return;
     }
     if (ctx->active_count <= 1) {
+        int slot = -1;
         for (int i = 0; i < GBA_MAX_INSTANCES; ++i) {
             if (ctx->instances[i].active && ctx->instances[i].video_buffer) {
-                video_render_instance_slot(i, back_buffer, ctx);
+                slot = i;
+                break;
             }
         }
+        if (slot < 0) {
+            return;
+        }
+
+        /* 1P: upscale 1x na thread principal; ajuste ao viewport dividido em bandas de linhas
+         * entre os 4 nucleos (banda j no worker j, banda 0 aqui) */
+        video_prepare_instance(slot, ctx);
+
+        init_workers();
+        s_video_back_buffer = back_buffer;
+        s_video_ctx = ctx;
+        s_video_band_slot = slot;
+        __atomic_thread_fence(__ATOMIC_RELEASE);
+
+        for (int j = 1; j < GBA_MAX_INSTANCES; ++j) {
+            if (s_workers[j].thread_created) {
+                __atomic_store_n(&s_workers[j].command, 5, __ATOMIC_RELEASE);
+            }
+        }
+        video_render_instance_band(slot, 0, GBA_MAX_INSTANCES, back_buffer, ctx);
+        for (int j = 1; j < GBA_MAX_INSTANCES; ++j) {
+            if (s_workers[j].thread_created) {
+                while (__atomic_load_n(&s_workers[j].command, __ATOMIC_ACQUIRE) != 0) {
+                    __builtin_ia32_pause();
+                }
+            } else {
+                video_render_instance_band(slot, j, GBA_MAX_INSTANCES, back_buffer, ctx);
+            }
+        }
+        video_draw_instance_border(slot, back_buffer, ctx);
         return;
     }
 

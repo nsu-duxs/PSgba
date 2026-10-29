@@ -13,13 +13,25 @@
 #include <sys/stat.h>
 #include <orbis/Pad.h>
 
-#define LAUNCHER_ROM_START_IDX 3
+#define LAUNCHER_ROM_START_IDX 6
+
+enum {
+    LAUNCHER_ITEM_FILTER = 0,
+    LAUNCHER_ITEM_SCALE,
+    LAUNCHER_ITEM_SMOOTH,
+    LAUNCHER_ITEM_DISPLAY,
+    LAUNCHER_ITEM_SHOW_FPS,
+    LAUNCHER_ITEM_FPS_LIMIT
+};
 
 enum {
     OSD_ITEM_RESUME = 0,
     OSD_ITEM_LINK_POWER,
     OSD_ITEM_LINK_HOTPLUG,
-    OSD_ITEM_VIDEO_RES,
+    OSD_ITEM_VIDEO_FILTER,
+    OSD_ITEM_VIDEO_SCALE,
+    OSD_ITEM_VIDEO_SMOOTH,
+    OSD_ITEM_VIDEO_DISPLAY,
     OSD_ITEM_SHOW_FPS,
     OSD_ITEM_FPS_LIMIT,
     OSD_ITEM_AUDIO_FOCUS,
@@ -41,7 +53,7 @@ static int s_rom_count = 0;
 static int s_usb_rom_count = 0;
 static char s_usb_status_str[128] = "USB: Verificando portas /mnt/usb0..7...";
 
-static int s_launcher_cursor = 0; /* 0 = Resolution, 1 = FPS, 2+ = ROM list */
+static int s_launcher_cursor = 0; /* 0..5 = opcoes de video/FPS, 6+ = lista de ROMs */
 static char s_launcher_status[128] = "";
 
 static int s_osd_cursor = 0;
@@ -400,6 +412,25 @@ void ui_menu_render_join_hint(uint32_t* fb, struct PS4GBA_Context* ctx) {
     ui_draw_text(fb, cur_x, text_y, " para entrar com novo jogador", 0xFFE2E8F0U, 2);
 }
 
+/* option: 0 = filtro, 1 = fator interno, 2 = suavizacao, 3 = modo de exibicao */
+static void ui_adjust_video_option(int option, uint32_t buttons_pressed) {
+    int delta = (buttons_pressed & ORBIS_PAD_BUTTON_LEFT) ? -1 : 1;
+    switch (option) {
+    case 0:
+        video_cycle_filter(delta);
+        break;
+    case 1:
+        video_cycle_scale(delta);
+        break;
+    case 2:
+        video_toggle_smoothing();
+        break;
+    default:
+        video_cycle_display_mode(delta);
+        break;
+    }
+}
+
 void ui_menu_update_launcher(struct PS4GBA_Context* ctx, uint32_t buttons_pressed) {
     (void)ctx;
 
@@ -454,18 +485,18 @@ void ui_menu_update_launcher(struct PS4GBA_Context* ctx, uint32_t buttons_presse
         s_launcher_cursor = (s_launcher_cursor + 1) % total_items;
     }
 
-    if (s_launcher_cursor == 0) {
-        if (buttons_pressed & ORBIS_PAD_BUTTON_LEFT) {
-            video_cycle_res_mode(-1);
+    if (s_launcher_cursor == LAUNCHER_ITEM_FILTER ||
+        s_launcher_cursor == LAUNCHER_ITEM_SCALE ||
+        s_launcher_cursor == LAUNCHER_ITEM_SMOOTH ||
+        s_launcher_cursor == LAUNCHER_ITEM_DISPLAY) {
+        if (buttons_pressed & (ORBIS_PAD_BUTTON_LEFT | ORBIS_PAD_BUTTON_RIGHT | ORBIS_PAD_BUTTON_CROSS)) {
+            ui_adjust_video_option(s_launcher_cursor, buttons_pressed);
         }
-        if (buttons_pressed & (ORBIS_PAD_BUTTON_RIGHT | ORBIS_PAD_BUTTON_CROSS)) {
-            video_cycle_res_mode(1);
-        }
-    } else if (s_launcher_cursor == 1) {
+    } else if (s_launcher_cursor == LAUNCHER_ITEM_SHOW_FPS) {
         if (buttons_pressed & (ORBIS_PAD_BUTTON_LEFT | ORBIS_PAD_BUTTON_RIGHT | ORBIS_PAD_BUTTON_CROSS)) {
             s_show_fps = !s_show_fps;
         }
-    } else if (s_launcher_cursor == 2) {
+    } else if (s_launcher_cursor == LAUNCHER_ITEM_FPS_LIMIT) {
         if (buttons_pressed & (ORBIS_PAD_BUTTON_LEFT | ORBIS_PAD_BUTTON_RIGHT | ORBIS_PAD_BUTTON_CROSS)) {
             video_toggle_fps_limit();
         }
@@ -513,10 +544,9 @@ void ui_menu_update_osd(struct PS4GBA_Context* ctx, uint32_t buttons_pressed) {
         return;
     }
 
-    if (s_osd_cursor == OSD_ITEM_VIDEO_RES &&
+    if (s_osd_cursor >= OSD_ITEM_VIDEO_FILTER && s_osd_cursor <= OSD_ITEM_VIDEO_DISPLAY &&
         (buttons_pressed & (ORBIS_PAD_BUTTON_LEFT | ORBIS_PAD_BUTTON_RIGHT | ORBIS_PAD_BUTTON_CROSS))) {
-        int delta = (buttons_pressed & ORBIS_PAD_BUTTON_LEFT) ? -1 : 1;
-        video_cycle_res_mode(delta);
+        ui_adjust_video_option(s_osd_cursor - OSD_ITEM_VIDEO_FILTER, buttons_pressed);
         return;
     }
 
@@ -611,32 +641,34 @@ void ui_menu_render_launcher(uint32_t* fb) {
     draw_rect_solid(fb, 0, 0, PS4_SCREEN_WIDTH, PS4_SCREEN_HEIGHT, 0xFF10141EU);
     draw_rect_border(fb, 60, 40, PS4_SCREEN_WIDTH - 120, PS4_SCREEN_HEIGHT - 80, 3, 0xFF3A86FFU);
 
-    ui_draw_text(fb, 120, 76, "PS4 GBA 4-WAY SPLIT-SCREEN EMULATOR v1.04", 0xFFFFFFFFU, 3);
+    ui_draw_text(fb, 120, 76, "PS4 GBA 4-WAY SPLIT-SCREEN EMULATOR v1.06", 0xFFFFFFFFU, 3);
 
     char line_buf[256];
-    snprintf(line_buf, sizeof(line_buf), "%s Resolucao / Qualidade: < %s >",
-             (s_launcher_cursor == 0) ? ">" : " ",
-             video_get_res_mode_name(video_get_res_mode()));
-    ui_draw_text(fb, 120, 142, line_buf,
-                 (s_launcher_cursor == 0) ? 0xFF00F5D4U : 0xFFCCCCCCU, 2);
-
-    snprintf(line_buf, sizeof(line_buf), "%s Mostrar Contador de FPS: < %s >",
-             (s_launcher_cursor == 1) ? ">" : " ",
+    char vopts[LAUNCHER_ROM_START_IDX][200];
+    snprintf(vopts[LAUNCHER_ITEM_FILTER], sizeof(vopts[0]), "Algoritmo de Pixel Art: < %s >",
+             video_get_filter_name(video_get_filter()));
+    snprintf(vopts[LAUNCHER_ITEM_SCALE], sizeof(vopts[0]), "Fator de Multiplicacao Interna: < %s >",
+             video_get_scale_name(video_get_scale()));
+    snprintf(vopts[LAUNCHER_ITEM_SMOOTH], sizeof(vopts[0]), "Suavizacao / Anti-Aliasing: < %s >",
+             video_get_smoothing_name(video_get_smoothing()));
+    snprintf(vopts[LAUNCHER_ITEM_DISPLAY], sizeof(vopts[0]), "Modo de Exibicao da Tela: < %s >",
+             video_get_display_mode_name(video_get_display_mode()));
+    snprintf(vopts[LAUNCHER_ITEM_SHOW_FPS], sizeof(vopts[0]), "Mostrar Contador de FPS: < %s >",
              s_show_fps ? "Ligado (Canto Superior)" : "Desligado");
-    ui_draw_text(fb, 120, 180, line_buf,
-                 (s_launcher_cursor == 1) ? 0xFF00F5D4U : 0xFFCCCCCCU, 2);
-
-    snprintf(line_buf, sizeof(line_buf), "%s Bloqueio de FPS: < %s >",
-             (s_launcher_cursor == 2) ? ">" : " ",
+    snprintf(vopts[LAUNCHER_ITEM_FPS_LIMIT], sizeof(vopts[0]), "Bloqueio de FPS: < %s >",
              video_get_fps_limit_name(video_get_fps_limit()));
-    ui_draw_text(fb, 120, 218, line_buf,
-                 (s_launcher_cursor == 2) ? 0xFF00F5D4U : 0xFFCCCCCCU, 2);
+
+    for (int i = 0; i < LAUNCHER_ROM_START_IDX; ++i) {
+        bool sel = (s_launcher_cursor == i);
+        snprintf(line_buf, sizeof(line_buf), "%s %s", sel ? ">" : " ", vopts[i]);
+        ui_draw_text(fb, 120, 130 + i * 34, line_buf, sel ? 0xFF00F5D4U : 0xFFCCCCCCU, 2);
+    }
 
     snprintf(line_buf, sizeof(line_buf),
              "ROMS disponiveis (%d encontradas - [TRIANGULO] Recarregar USB):", s_rom_count);
-    ui_draw_text(fb, 120, 260, line_buf, 0xFFFFBE0BU, 2);
+    ui_draw_text(fb, 120, 338, line_buf, 0xFFFFBE0BU, 2);
 
-    int max_visible = 15;
+    int max_visible = 12;
     int selected_rom = (s_launcher_cursor >= LAUNCHER_ROM_START_IDX)
                            ? (s_launcher_cursor - LAUNCHER_ROM_START_IDX)
                            : 0;
@@ -651,9 +683,8 @@ void ui_menu_render_launcher(uint32_t* fb) {
                  is_sel ? "->" : "  ", idx + 1, s_rom_files[idx]);
 
         uint32_t text_color = is_sel ? 0xFF00F5D4U : (is_usb ? 0xFF64DFDFU : 0xFFCBD5E1U);
-        ui_draw_text(fb, 140, 298 + i * 36, line_buf, text_color, 2);
+        ui_draw_text(fb, 140, 376 + i * 34, line_buf, text_color, 2);
     }
-
     /* Informacoes de status do USB e varredura */
     uint32_t usb_color = (s_usb_rom_count > 0) ? 0xFF00F5D4U : 0xFFFFBE0BU;
     ui_draw_text(fb, 120, 874, s_usb_status_str, usb_color, 2);
@@ -681,7 +712,7 @@ void ui_menu_render_osd(uint32_t* fb, struct PS4GBA_Context* ctx) {
     draw_rect_border(fb, box_x, box_y, box_w, box_h, 3, 0xFF00F5D4U);
 
     char buf[160];
-    snprintf(buf, sizeof(buf), "MENU OSD v1.04 - CONTROLE P%d (%s)",
+    snprintf(buf, sizeof(buf), "MENU OSD v1.06 - CONTROLE P%d (%s)",
              s_osd_player + 1, ctx ? ctx->rom_name : "");
     ui_draw_text(fb, box_x + 50, box_y + 32, buf, 0xFFFFBE0BU, 3);
 
@@ -691,9 +722,22 @@ void ui_menu_render_osd(uint32_t* fb, struct PS4GBA_Context* ctx) {
                                       : (link_hub_is_cable_enabled() ? "LIGADO / CONECTADO" : "DESLIGADO");
     snprintf(item_link_power, sizeof(item_link_power), "Estado do Link Cable: < %s >", cable_state_str);
 
-    char item_res[140];
-    snprintf(item_res, sizeof(item_res), "Resolucao / Qualidade: < %s >",
-             video_get_res_mode_name(video_get_res_mode()));
+    char item_filter[140];
+    snprintf(item_filter, sizeof(item_filter), "Algoritmo de Pixel Art: < %s >",
+             video_get_filter_name(video_get_filter()));
+
+    char item_scale[140];
+    snprintf(item_scale, sizeof(item_scale), "Fator Interno: < %s >%s",
+             video_get_scale_name(video_get_scale()),
+             video_get_auto_degrade_level() > 0 ? "  [AUTO: qualidade reduzida p/ manter 60 FPS]" : "");
+
+    char item_smooth[140];
+    snprintf(item_smooth, sizeof(item_smooth), "Suavizacao: < %s >",
+             video_get_smoothing_name(video_get_smoothing()));
+
+    char item_display[140];
+    snprintf(item_display, sizeof(item_display), "Exibicao: < %s >",
+             video_get_display_mode_name(video_get_display_mode()));
 
     char item_fps[96];
     snprintf(item_fps, sizeof(item_fps), "Contador de FPS na Tela: < %s >",
@@ -724,7 +768,10 @@ void ui_menu_render_osd(uint32_t* fb, struct PS4GBA_Context* ctx) {
         "Continuar Jogo",
         item_link_power,
         "Conectar / Reconectar Link Cable (Simular Hotplug)",
-        item_res,
+        item_filter,
+        item_scale,
+        item_smooth,
+        item_display,
         item_fps,
         item_fps_limit,
         item_audio,
@@ -738,7 +785,7 @@ void ui_menu_render_osd(uint32_t* fb, struct PS4GBA_Context* ctx) {
     for (int i = 0; i < OSD_ITEM_COUNT; ++i) {
         bool sel = (s_osd_cursor == i);
         snprintf(buf, sizeof(buf), "%s %s", sel ? "->" : "  ", items[i]);
-        ui_draw_text(fb, box_x + 50, box_y + 92 + i * 46, buf,
+        ui_draw_text(fb, box_x + 50, box_y + 88 + i * 40, buf,
                      sel ? 0xFF00F5D4U : 0xFFE0E0E0U, 2);
     }
 
@@ -752,13 +799,13 @@ void ui_menu_render_osd(uint32_t* fb, struct PS4GBA_Context* ctx) {
     char link_info[140];
     snprintf(link_info, sizeof(link_info), "Status Link: P1 [%s]  P2 [%s]  |  Cabo: %s  |  Pacotes: %u",
              mode0_str, mode1_str, link_hub_is_cable_enabled() ? "ON" : "OFF", xfer_pkts);
-    ui_draw_text(fb, box_x + 50, box_y + 620, link_info, 0xFF00F5D4U, 2);
+    ui_draw_text(fb, box_x + 50, box_y + 706, link_info, 0xFF00F5D4U, 2);
 
     if (s_osd_status[0]) {
-        ui_draw_text(fb, box_x + 50, box_y + 668, s_osd_status, 0xFF38B000U, 2);
+        ui_draw_text(fb, box_x + 50, box_y + 744, s_osd_status, 0xFF38B000U, 2);
     }
 
-    ui_draw_text(fb, box_x + 50, box_y + 720,
+    ui_draw_text(fb, box_x + 50, box_y + 790,
                  "[X / SETAS] Selecionar   [OPTIONS no Controle 2/3/4] Entrar no Jogo   [CIRCLE] Fechar",
                  0xFF8899AAU, 2);
 }
