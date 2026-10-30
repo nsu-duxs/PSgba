@@ -15,6 +15,22 @@ typedef enum UIAppState {
     UI_STATE_OSD      = 2
 } UIAppState;
 
+typedef enum LauncherTab {
+    LAUNCHER_TAB_GAMES = 0,
+    LAUNCHER_TAB_VIDEO_AUDIO = 1,
+    LAUNCHER_TAB_CONTROLS = 2,
+    LAUNCHER_TAB_COUNT = 3
+} LauncherTab;
+
+typedef enum OsdTab {
+    OSD_TAB_SAVES = 0,
+    OSD_TAB_VIDEO_AUDIO = 1,
+    OSD_TAB_SETTINGS = 1, /* Alias de compatibilidade */
+    OSD_TAB_LINK_CABLE = 2,
+    OSD_TAB_CONTROLS = 3,
+    OSD_TAB_COUNT = 4
+} OsdTab;
+
 void ui_menu_init(void);
 void ui_menu_scan_roms(void);
 

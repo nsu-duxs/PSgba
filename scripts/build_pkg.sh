@@ -140,7 +140,7 @@ rm -f "${PARAM_SFO}"
 
 "${PKGTOOL}" sfo_new "${PARAM_SFO}"
 "${PKGTOOL}" sfo_setentry "${PARAM_SFO}" APP_TYPE --type Integer --maxsize 4 --value 1
-"${PKGTOOL}" sfo_setentry "${PARAM_SFO}" APP_VER --type Utf8 --maxsize 8 --value "01.06"
+"${PKGTOOL}" sfo_setentry "${PARAM_SFO}" APP_VER --type Utf8 --maxsize 8 --value "01.07"
 "${PKGTOOL}" sfo_setentry "${PARAM_SFO}" ATTRIBUTE --type Integer --maxsize 4 --value 0
 "${PKGTOOL}" sfo_setentry "${PARAM_SFO}" CATEGORY --type Utf8 --maxsize 4 --value "${APP_CATEGORY}"
 "${PKGTOOL}" sfo_setentry "${PARAM_SFO}" CONTENT_ID --type Utf8 --maxsize 48 --value "${CONTENT_ID}"
@@ -148,7 +148,7 @@ rm -f "${PARAM_SFO}"
 "${PKGTOOL}" sfo_setentry "${PARAM_SFO}" SYSTEM_VER --type Integer --maxsize 4 --value "${SYS_VER_DEC}"
 "${PKGTOOL}" sfo_setentry "${PARAM_SFO}" TITLE --type Utf8 --maxsize 128 --value "${APP_TITLE}"
 "${PKGTOOL}" sfo_setentry "${PARAM_SFO}" TITLE_ID --type Utf8 --maxsize 12 --value "${TITLE_ID}"
-"${PKGTOOL}" sfo_setentry "${PARAM_SFO}" VERSION --type Utf8 --maxsize 8 --value "01.06"
+"${PKGTOOL}" sfo_setentry "${PARAM_SFO}" VERSION --type Utf8 --maxsize 8 --value "01.07"
 
 # Constrói o arquivo .gp4 e compila o pacote final PS4-GBA-4P.pkg
 rm -f "${GP4_FILE}" "${OUTPUT_PKG}"
