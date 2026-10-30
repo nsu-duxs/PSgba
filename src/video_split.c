@@ -708,6 +708,23 @@ void video_render_split_screen(struct PS4GBA_Context* ctx) {
         return;
     }
 
+    if (ui_state == UI_STATE_DISCLAIMER) {
+        update_fps_counter();
+        s_prev_ui_state = ui_state;
+        s_clear_frames_remaining = NUM_FRAMEBUFFERS;
+        ui_menu_render_disclaimer(back_buffer);
+        if (s_submitted_flip_arg > 0) {
+            wait_for_flip(s_submitted_flip_arg);
+        }
+        int64_t flip_id = s_flip_arg++;
+        sceVideoOutSubmitFlip(s_video_handle, s_buffer_index,
+                              ORBIS_VIDEO_OUT_FLIP_VSYNC, flip_id);
+        s_submitted_flip_arg = flip_id;
+        s_buffer_index = (s_buffer_index + 1) % NUM_FRAMEBUFFERS;
+        pace_frame_60hz();
+        return;
+    }
+
     if (ui_state == UI_STATE_LAUNCHER) {
         update_fps_counter();
         s_prev_ui_state = ui_state;

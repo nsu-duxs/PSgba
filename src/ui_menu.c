@@ -1169,6 +1169,45 @@ void ui_menu_render_join_hint(uint32_t* fb, struct PS4GBA_Context* ctx) {
 #define COLOR_PS_NEON_BLUE     0xFF2E86DEU /* Azul Neon vibrante */
 #define COLOR_SPLASH_CYAN      0xFF00F5D4U /* Ciano Neon */
 
+/* ==============================================================================
+ * TERMO DE USO / AVISO ANTI-PIRATARIA (FIRST-TIME RUN DISCLAIMER)
+ * Persistencia em disco persistente no PS4: /data/PSgba/disclaimer_accepted.bin
+ * ============================================================================== */
+
+#define UI_DISCLAIMER_DIR        "/data/PSgba"
+#define UI_DISCLAIMER_FLAG_PATH  "/data/PSgba/disclaimer_accepted.bin"
+
+static int s_disclaimer_frame = 0;
+
+static bool ui_disclaimer_is_accepted(void) {
+    struct stat st;
+    if (stat(UI_DISCLAIMER_FLAG_PATH, &st) == 0) {
+        return true;
+    }
+    if (stat("/data/gba4p/disclaimer_accepted.bin", &st) == 0) {
+        return true;
+    }
+    return false;
+}
+
+static void ui_disclaimer_mark_accepted(void) {
+    mkdir("/data", 0777);
+    mkdir(UI_DISCLAIMER_DIR, 0777);
+    FILE* f = fopen(UI_DISCLAIMER_FLAG_PATH, "wb");
+    if (f) {
+        uint8_t flag = 1;
+        fwrite(&flag, 1, sizeof(flag), f);
+        fclose(f);
+    }
+    mkdir("/data/gba4p", 0777);
+    FILE* f2 = fopen("/data/gba4p/disclaimer_accepted.bin", "wb");
+    if (f2) {
+        uint8_t flag = 1;
+        fwrite(&flag, 1, sizeof(flag), f2);
+        fclose(f2);
+    }
+}
+
 void ui_menu_update_splash(uint32_t buttons_pressed) {
     if (!buttons_pressed) {
         return;
@@ -1179,8 +1218,12 @@ void ui_menu_update_splash(uint32_t buttons_pressed) {
         s_splash_frame = 180;
         audio_play_splash_sfx(SPLASH_SFX_CONFIRM);
     } else {
-        /* Qualquer botao pressionado no estado Title Screen inicia o Launcher */
-        s_app_state = UI_STATE_LAUNCHER;
+        /* Qualquer botao pressionado no estado Title Screen verifica o termo */
+        if (ui_disclaimer_is_accepted()) {
+            s_app_state = UI_STATE_LAUNCHER;
+        } else {
+            s_app_state = UI_STATE_DISCLAIMER;
+        }
         s_splash_frame = 0;
         audio_play_splash_sfx(SPLASH_SFX_CONFIRM);
     }
@@ -1535,6 +1578,134 @@ void ui_menu_render_splash(uint32_t* fb) {
 
     /* Avanço contínuo do fotograma (loop infinito de animação idle na Title Screen) */
     s_splash_frame++;
+}
+
+void ui_menu_update_disclaimer(uint32_t buttons_pressed) {
+    if (!buttons_pressed) {
+        return;
+    }
+
+    /* Somente o botao Cruz [X] confirma e avanca */
+    if (buttons_pressed & ORBIS_PAD_BUTTON_CROSS) {
+        ui_disclaimer_mark_accepted();
+        audio_play_sfx(UI_SFX_CONFIRM);
+        s_app_state = UI_STATE_LAUNCHER;
+        s_disclaimer_frame = 0;
+    }
+    /* Todos os outros botoes sao bloqueados para impedir desvio do termo */
+}
+
+void ui_menu_render_disclaimer(uint32_t* fb) {
+    if (!fb || s_app_state != UI_STATE_DISCLAIMER) {
+        return;
+    }
+
+    /* Fundo Azul-Escuro Profundo Padronizado */
+    draw_rect_solid(fb, 0, 0, PS4_SCREEN_WIDTH, PS4_SCREEN_HEIGHT, 0xFF080C14U);
+
+    int card_w = 1300;
+    int card_h = 720;
+    int card_x = (PS4_SCREEN_WIDTH - card_w) / 2;   /* 310 */
+    int card_y = (PS4_SCREEN_HEIGHT - card_h) / 2;  /* 180 */
+
+    /* Moldura Central Estilo RPG 16-bit com Borda Dupla Neon */
+    draw_rect_solid(fb, card_x, card_y, card_w, card_h, 0xFF0E1A2DU);
+    draw_rect_border(fb, card_x, card_y, card_w, card_h, 3, COLOR_BORDER_CYAN);
+    draw_rect_border(fb, card_x + 5, card_y + 5, card_w - 10, card_h - 10, 2, COLOR_TEXT_GOLD);
+    draw_rect_border(fb, card_x + 9, card_y + 9, card_w - 18, card_h - 18, 1, COLOR_BORDER_INNER);
+
+    /* Pinos de Acabamento Dourados nos Cantos */
+    draw_rect_solid(fb, card_x + 2, card_y + 2, 6, 6, COLOR_TEXT_GOLD);
+    draw_rect_solid(fb, card_x + card_w - 8, card_y + 2, 6, 6, COLOR_TEXT_GOLD);
+    draw_rect_solid(fb, card_x + 2, card_y + card_h - 8, 6, 6, COLOR_TEXT_GOLD);
+    draw_rect_solid(fb, card_x + card_w - 8, card_y + card_h - 8, 6, 6, COLOR_TEXT_GOLD);
+
+    /* Titulo Superior Centrado: [ AVISO LEGAL & COMPROMISSO ] */
+    const char* title = "[ AVISO LEGAL & COMPROMISSO ]";
+    int title_len = (int)strlen(title);
+    int title_x = (PS4_SCREEN_WIDTH - (title_len * 16)) / 2;
+    ui_draw_text(fb, title_x, card_y + 26, title, COLOR_TEXT_GOLD, 2);
+
+    /* Linha Divisoria abaixo do Titulo */
+    draw_line_h(fb, card_x + 30, card_y + 58, card_w - 60, 2, COLOR_BORDER_CYAN);
+    draw_rect_solid(fb, (PS4_SCREEN_WIDTH / 2) - 15, card_y + 56, 30, 6, COLOR_TEXT_GOLD);
+
+    /* Paragrafo 1: Finalidade do Projeto */
+    int text_x = card_x + 45; /* 355 */
+    ui_draw_text(fb, text_x, card_y + 80,
+                 "Este projeto foi desenvolvido estritamente para fins de",
+                 COLOR_TEXT_LIGHT, 2);
+    ui_draw_text(fb, text_x, card_y + 106,
+                 "preservacao historica e engenharia de software.",
+                 COLOR_TEXT_LIGHT, 2);
+
+    /* Banner em Destaque Vermelho: Manifesto Anti-Pirataria */
+    int banner_y = card_y + 140;
+    int banner_w = card_w - 70;
+    int banner_x = card_x + 35;
+    draw_rect_solid(fb, banner_x, banner_y, banner_w, 42, 0xFF360A0AU);
+    draw_rect_border(fb, banner_x, banner_y, banner_w, 42, 2, COLOR_TEXT_RED);
+
+    const char* alert_msg = "Somos COMPLETAMENTE CONTRA A PIRATARIA em qualquer forma.";
+    int alert_len = (int)strlen(alert_msg);
+    int alert_x = (PS4_SCREEN_WIDTH - (alert_len * 16)) / 2;
+    ui_draw_text(fb, alert_x, banner_y + 13, alert_msg, COLOR_TEXT_RED, 2);
+
+    /* Paragrafo 2: Introducao aos Compromissos */
+    ui_draw_text(fb, text_x, card_y + 204,
+                 "Ao utilizar o PSgba, voce declara e concorda que:",
+                 COLOR_TEXT_WHITE, 2);
+
+    /* Compromisso 1 */
+    int item_x = text_x + 20; /* 375 */
+    ui_draw_text(fb, item_x, card_y + 242, "1.", COLOR_TEXT_GOLD, 2);
+    ui_draw_text(fb, item_x + 48, card_y + 242,
+                 "Nao utilizara pirataria para obter quaisquer ROMs",
+                 COLOR_TEXT_LIGHT, 2);
+    ui_draw_text(fb, item_x + 48, card_y + 268,
+                 "ou arquivos de BIOS.",
+                 COLOR_TEXT_LIGHT, 2);
+
+    /* Compromisso 2 */
+    ui_draw_text(fb, item_x, card_y + 308, "2.", COLOR_TEXT_GOLD, 2);
+    ui_draw_text(fb, item_x + 48, card_y + 308,
+                 "Utilizara exclusivamente copias de seguranca (backups) geradas a",
+                 COLOR_TEXT_LIGHT, 2);
+    ui_draw_text(fb, item_x + 48, card_y + 334,
+                 "partir dos seus proprios cartuchos originais legalmente adquiridos.",
+                 COLOR_TEXT_LIGHT, 2);
+
+    /* Compromisso 3 */
+    ui_draw_text(fb, item_x, card_y + 374, "3.", COLOR_TEXT_GOLD, 2);
+    ui_draw_text(fb, item_x + 48, card_y + 374,
+                 "Assume total responsabilidade pelo conteudo executado",
+                 COLOR_TEXT_LIGHT, 2);
+    ui_draw_text(fb, item_x + 48, card_y + 400,
+                 "neste dispositivo.",
+                 COLOR_TEXT_LIGHT, 2);
+
+    /* Botao de Confirmacao Animado Pulsante no Rodape */
+    int btn_w = 640;
+    int btn_h = 56;
+    int btn_x = (PS4_SCREEN_WIDTH - btn_w) / 2;  /* 640 */
+    int btn_base_y = card_y + card_h - 96;       /* 180 + 720 - 96 = 804 */
+    int pulse = (int)(sinf((float)s_disclaimer_frame * 0.12f) * 3.0f);
+    int btn_y = btn_base_y + pulse;
+
+    uint32_t btn_border_col = ((s_disclaimer_frame / 20) % 2 == 0) ? COLOR_BORDER_CYAN : COLOR_TEXT_GOLD;
+    draw_rect_solid(fb, btn_x, btn_y, btn_w, btn_h, COLOR_ITEM_SEL_BG);
+    draw_rect_border(fb, btn_x, btn_y, btn_w, btn_h, 3, btn_border_col);
+
+    /* Texto do Botao: [X] Concordo e Desejo Prosseguir */
+    const char* btn_text = "[X] Concordo e Desejo Prosseguir";
+    int btn_text_len = (int)strlen(btn_text);
+    int btn_text_x = (PS4_SCREEN_WIDTH - (btn_text_len * 16)) / 2;
+    int btn_text_y = btn_y + (btn_h - 16) / 2;
+
+    ui_draw_text(fb, btn_text_x, btn_text_y, "[X]", COLOR_PS_CROSS, 2);
+    ui_draw_text(fb, btn_text_x + 48, btn_text_y, " Concordo e Desejo Prosseguir", COLOR_TEXT_WHITE, 2);
+
+    s_disclaimer_frame++;
 }
 
 /* ==============================================================================

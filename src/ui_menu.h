@@ -11,10 +11,11 @@
 #define UI_MAX_PATH      256
 
 typedef enum UIAppState {
-    UI_STATE_SPLASH   = 0,
-    UI_STATE_LAUNCHER = 1,
-    UI_STATE_INGAME   = 2,
-    UI_STATE_OSD      = 3
+    UI_STATE_SPLASH     = 0,
+    UI_STATE_DISCLAIMER = 1,
+    UI_STATE_LAUNCHER   = 2,
+    UI_STATE_INGAME     = 3,
+    UI_STATE_OSD        = 4
 } UIAppState;
 
 typedef enum LauncherTab {
@@ -46,10 +47,12 @@ void ui_menu_trigger_join_hint(void);
 void ui_menu_render_join_hint(uint32_t* fb, struct PS4GBA_Context* ctx);
 
 void ui_menu_update_splash(uint32_t buttons_pressed);
+void ui_menu_update_disclaimer(uint32_t buttons_pressed);
 void ui_menu_update_launcher(struct PS4GBA_Context* ctx, uint32_t buttons_pressed);
 void ui_menu_update_osd(struct PS4GBA_Context* ctx, uint32_t buttons_pressed);
 
 void ui_menu_render_splash(uint32_t* fb);
+void ui_menu_render_disclaimer(uint32_t* fb);
 void ui_menu_render_launcher(uint32_t* fb);
 void ui_menu_render_osd(uint32_t* fb, struct PS4GBA_Context* ctx);
 void ui_menu_render_fps_overlay(uint32_t* fb, int fps);
