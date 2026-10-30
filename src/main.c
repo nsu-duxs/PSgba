@@ -359,12 +359,13 @@ int main(int argc, char* argv[]) {
 
     input_init();
     audio_init();
-    ui_menu_init();
+    ui_menu_init(); /* Inicia no estado animado UI_STATE_SPLASH */
 
     bool running = true;
     while (running) {
         input_poll_all(&g_gba_ctx);
 
+        /* Emula apenas durante o jogo ativo; Splash e Menus renderizam independentes a 60 FPS */
         if (ui_menu_get_state() == UI_STATE_INGAME) {
             emulator_step_lockstep_frame();
             audio_process(&g_gba_ctx);

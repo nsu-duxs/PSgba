@@ -136,6 +136,14 @@ void input_poll_all(struct PS4GBA_Context* ctx) {
         }
         s_prev_l3_r3[i] = l3_r3_pressed;
 
+        if (app_state == UI_STATE_SPLASH) {
+            if (newly_pressed) {
+                ui_menu_update_splash(newly_pressed);
+                app_state = ui_menu_get_state();
+            }
+            continue;
+        }
+
         if (app_state == UI_STATE_LAUNCHER) {
             if (newly_pressed) {
                 ui_menu_update_launcher(ctx, newly_pressed);

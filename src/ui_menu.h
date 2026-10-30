@@ -4,15 +4,17 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "emulator_manager.h"
+#include "audio_ps4.h"
 
 #define UI_MAX_ROMS      512
 #define UI_MAX_FILENAME  128
 #define UI_MAX_PATH      256
 
 typedef enum UIAppState {
-    UI_STATE_LAUNCHER = 0,
-    UI_STATE_INGAME   = 1,
-    UI_STATE_OSD      = 2
+    UI_STATE_SPLASH   = 0,
+    UI_STATE_LAUNCHER = 1,
+    UI_STATE_INGAME   = 2,
+    UI_STATE_OSD      = 3
 } UIAppState;
 
 typedef enum LauncherTab {
@@ -43,9 +45,11 @@ void ui_menu_set_fps_visible(bool visible);
 void ui_menu_trigger_join_hint(void);
 void ui_menu_render_join_hint(uint32_t* fb, struct PS4GBA_Context* ctx);
 
+void ui_menu_update_splash(uint32_t buttons_pressed);
 void ui_menu_update_launcher(struct PS4GBA_Context* ctx, uint32_t buttons_pressed);
 void ui_menu_update_osd(struct PS4GBA_Context* ctx, uint32_t buttons_pressed);
 
+void ui_menu_render_splash(uint32_t* fb);
 void ui_menu_render_launcher(uint32_t* fb);
 void ui_menu_render_osd(uint32_t* fb, struct PS4GBA_Context* ctx);
 void ui_menu_render_fps_overlay(uint32_t* fb, int fps);

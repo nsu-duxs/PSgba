@@ -11,6 +11,7 @@
 #include <strings.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <math.h>
 #include <orbis/Pad.h>
 
 /* ==============================================================================
@@ -61,6 +62,7 @@ enum {
     LAUNCHER_VA_SHOW_FPS,
     LAUNCHER_VA_FPS_LIMIT,
     LAUNCHER_VA_AUDIO_MODE,
+    LAUNCHER_VA_MENU_SFX,
     LAUNCHER_VA_COUNT
 };
 
@@ -84,6 +86,7 @@ enum {
     OSD_CFG_SHOW_FPS,
     OSD_CFG_FPS_LIMIT,
     OSD_CFG_AUDIO_FOCUS,
+    OSD_CFG_MENU_SFX,
     OSD_CFG_COUNT
 };
 
@@ -98,7 +101,8 @@ enum {
 
 #define ROM_PAGE_SIZE 12
 
-static UIAppState s_app_state = UI_STATE_LAUNCHER;
+static UIAppState s_app_state = UI_STATE_SPLASH;
+static int s_splash_frame = 0;
 static bool s_show_fps = true;
 static int s_join_hint_frames = 0;
 
@@ -1059,7 +1063,8 @@ void ui_menu_scan_roms(void) {
 void ui_menu_init(void) {
     save_manager_init();
     ui_menu_scan_roms();
-    s_app_state = UI_STATE_LAUNCHER;
+    s_app_state = UI_STATE_SPLASH;
+    s_splash_frame = 0;
     s_launcher_tab = LAUNCHER_TAB_GAMES;
     s_launcher_rom_cursor = 0;
     s_launcher_va_cursor = 0;
@@ -1092,6 +1097,7 @@ void ui_menu_open_osd(int trigger_player) {
     s_osd_status[0] = '\0';
     s_controls_view_gba = false;
     s_app_state = UI_STATE_OSD;
+    audio_play_sfx(UI_SFX_CONFIRM);
 }
 
 bool ui_menu_is_osd_open(void) {
@@ -1154,6 +1160,384 @@ void ui_menu_render_join_hint(uint32_t* fb, struct PS4GBA_Context* ctx) {
 }
 
 /* ==============================================================================
+ * TELA DE INICIALIZACAO ANIMADA (SPLASH SCREEN / INTRO): "DO PS4 AS 4 TELAS"
+ * 180 Frames @ 60 FPS (~3 Segundos) - 100% Procedural e Zero Alocacao Dinamica
+ * ============================================================================== */
+
+#define COLOR_SPLASH_BG        0xFF050811U /* Preto Profundo */
+#define COLOR_PS_CLASSIC_BLUE  0xFF003791U /* Azul PlayStation Oficial */
+#define COLOR_PS_NEON_BLUE     0xFF2E86DEU /* Azul Neon vibrante */
+#define COLOR_SPLASH_CYAN      0xFF00F5D4U /* Ciano Neon */
+
+void ui_menu_update_splash(uint32_t buttons_pressed) {
+    if (!buttons_pressed) {
+        return;
+    }
+
+    if (s_splash_frame < 180) {
+        /* Pula a animacao de introducao direto para a Title Screen pronta */
+        s_splash_frame = 180;
+        audio_play_splash_sfx(SPLASH_SFX_CONFIRM);
+    } else {
+        /* Qualquer botao pressionado no estado Title Screen inicia o Launcher */
+        s_app_state = UI_STATE_LAUNCHER;
+        s_splash_frame = 0;
+        audio_play_splash_sfx(SPLASH_SFX_CONFIRM);
+    }
+}
+
+void ui_menu_render_splash(uint32_t* fb) {
+    if (!fb || s_app_state != UI_STATE_SPLASH) {
+        return;
+    }
+
+    int frame = s_splash_frame;
+    int cx = PS4_SCREEN_WIDTH / 2;  /* 960 */
+    int cy = PS4_SCREEN_HEIGHT / 2; /* 540 */
+
+    /* Fundo Preto Profundo Padronizado */
+    draw_rect_solid(fb, 0, 0, PS4_SCREEN_WIDTH, PS4_SCREEN_HEIGHT, COLOR_SPLASH_BG);
+
+    /* SFX 1: Impacto Inicial do "4" (Fotograma 1) */
+    if (frame == 1) {
+        audio_play_splash_sfx(SPLASH_SFX_IMPACT);
+    }
+
+    /* --------------------------------------------------------------------------
+     * FASE 1 (Fotogramas 0 a 45): O "4" do PS4
+     * -------------------------------------------------------------------------- */
+    if (frame < 50) {
+        int stem_x = cx + 20;
+        int stem_y = cy - 100;
+        int stem_w = 40;
+        int stem_h = 190;
+
+        int bar_x = cx - 80;
+        int bar_y = cy + 10;
+        int bar_w = 160;
+        int bar_h = 36;
+
+        int diag_top_x = cx + 20;
+        int diag_top_y = cy - 100;
+        int diag_bot_x = cx - 80;
+        int diag_bot_y = cy + 20;
+
+        /* Materializacao progressiva */
+        int draw_limit_h = (frame < 15) ? ((frame * stem_h) / 15) : stem_h;
+
+        /* Haste Vertical Direita do "4" */
+        if (draw_limit_h > 0) {
+            draw_rect_solid(fb, stem_x, stem_y, stem_w, draw_limit_h, COLOR_PS_CLASSIC_BLUE);
+            draw_rect_border(fb, stem_x, stem_y, stem_w, draw_limit_h, 2, COLOR_PS_NEON_BLUE);
+        }
+
+        /* Barra Horizontal Central do "4" */
+        if (frame >= 8) {
+            int draw_bar_w = (frame < 20) ? ((frame - 8) * bar_w) / 12 : bar_w;
+            draw_rect_solid(fb, bar_x, bar_y, draw_bar_w, bar_h, COLOR_PS_CLASSIC_BLUE);
+            draw_rect_border(fb, bar_x, bar_y, draw_bar_w, bar_h, 2, COLOR_PS_NEON_BLUE);
+        }
+
+        /* Haste Diagonal Esquerda do "4" */
+        if (frame >= 5) {
+            int diag_steps = 28;
+            int max_steps = (frame < 20) ? ((frame - 5) * diag_steps) / 15 : diag_steps;
+            for (int s = 0; s < max_steps; ++s) {
+                int px = diag_top_x - (s * (diag_top_x - diag_bot_x)) / diag_steps;
+                int py = diag_top_y + (s * (diag_bot_y - diag_top_y)) / diag_steps;
+                draw_rect_solid(fb, px - 30, py, 32, 6, COLOR_PS_CLASSIC_BLUE);
+                draw_rect_border(fb, px - 30, py, 32, 6, 1, COLOR_PS_NEON_BLUE);
+            }
+        }
+
+        /* Pulso de brilho neon percorre o número (Frames 15 a 45) */
+        if (frame >= 15 && frame < 45) {
+            int pulse_y = (cy - 100) + ((frame - 15) * 7) % 200;
+            draw_line_h(fb, cx - 85, pulse_y, 170, 3, COLOR_SPLASH_CYAN);
+            draw_line_h(fb, cx - 75, pulse_y + 1, 150, 1, 0xFFFFFFFFU);
+        }
+
+        /* Logotipo PS4 na base da fase inicial */
+        if (frame >= 12) {
+            ui_draw_text(fb, cx - 24, cy + 120, "PS4", COLOR_PS_NEON_BLUE, 2);
+        }
+    }
+
+    /* --------------------------------------------------------------------------
+     * FASE 2 (Fotogramas 45 a 90): A Metamorfose: O "4" se divide em 4 Telas
+     * -------------------------------------------------------------------------- */
+    if (frame >= 45) {
+        /* SFX 2: Arpejo GBA 4 notas (D4, A4, D5, F#5) na divisao das 4 telas */
+        if (frame == 58) {
+            audio_play_splash_sfx(SPLASH_SFX_QUAD_CHIME);
+        }
+        int t = frame - 45; /* 0 a 135 */
+
+        /* Transicao das hastes do "4" para a cruz divisoria dos 4 quadrantes */
+        int vert_y1 = (t < 30) ? ((cy - 100) - ((cy - 100) * t) / 30) : 0;
+        int vert_y2 = (t < 30) ? ((cy + 90) + ((PS4_SCREEN_HEIGHT - (cy + 90)) * t) / 30) : PS4_SCREEN_HEIGHT;
+        int vert_w  = (t < 30) ? (40 - (36 * t) / 30) : 4;
+        int vert_x  = (t < 30) ? ((cx + 20) - (20 * t) / 30) : (cx - vert_w / 2);
+
+        int horiz_x1 = (t < 30) ? ((cx - 80) - ((cx - 80) * t) / 30) : 0;
+        int horiz_x2 = (t < 30) ? ((cx + 80) + ((PS4_SCREEN_WIDTH - (cx + 80)) * t) / 30) : PS4_SCREEN_WIDTH;
+        int horiz_h  = (t < 30) ? (36 - (32 * t) / 30) : 4;
+        int horiz_y  = (t < 30) ? ((cy + 20) - (20 * t) / 30) : (cy - horiz_h / 2);
+
+        /* Desenho das linhas divisorias da cruz 4-Way Split-Screen */
+        draw_rect_solid(fb, vert_x, vert_y1, vert_w, vert_y2 - vert_y1, COLOR_PS_NEON_BLUE);
+        draw_rect_solid(fb, horiz_x1, horiz_y, horiz_x2 - horiz_x1, horiz_h, COLOR_PS_NEON_BLUE);
+
+        /* 4 Mini-Telas de GBA em proporcao 3:2 (Acendem nos 4 Quadrantes) */
+        if (frame >= 55) {
+            int qf = frame - 55;
+            int max_w = 270;
+            int max_h = 180;
+            int cur_w = (qf < 20) ? (max_w * qf) / 20 : max_w;
+            int cur_h = (qf < 20) ? (max_h * qf) / 20 : max_h;
+
+            if (cur_w > 10 && cur_h > 10) {
+                int quad_centers[4][2] = {
+                    { 480, 270 },   /* Q1 (P1): Top-Left     */
+                    { 1440, 270 },  /* Q2 (P2): Top-Right    */
+                    { 480, 810 },   /* Q3 (P3): Bottom-Left  */
+                    { 1440, 810 }   /* Q4 (P4): Bottom-Right */
+                };
+
+                uint32_t p_colors[4] = {
+                    0xFF2E86DEU, /* P1: Azul     */
+                    0xFFEE5253U, /* P2: Vermelho */
+                    0xFF10AC84U, /* P3: Verde    */
+                    0xFFE056FDU  /* P4: Rosa     */
+                };
+
+                uint32_t p_fills[4] = {
+                    0xFF0A1E36U,
+                    0xFF360A0AU,
+                    0xFF0A361EU,
+                    0xFF320A36U
+                };
+
+                const char* p_tags[4] = { "P1", "P2", "P3", "P4" };
+
+                for (int p = 0; p < 4; ++p) {
+                    int qx = quad_centers[p][0];
+                    int qy = quad_centers[p][1];
+
+                    /* Moldura externa do mini-GBA */
+                    draw_rect_solid(fb, qx - cur_w / 2 - 10, qy - cur_h / 2 - 8, cur_w + 20, cur_h + 16, 0xFF0E1A2DU);
+                    draw_rect_border(fb, qx - cur_w / 2 - 10, qy - cur_h / 2 - 8, cur_w + 20, cur_h + 16, 2, 0xFF1D3557U);
+
+                    /* Display LCD 3:2 iluminado na cor do jogador */
+                    draw_rect_solid(fb, qx - cur_w / 2, qy - cur_h / 2, cur_w, cur_h, p_fills[p]);
+                    draw_rect_border(fb, qx - cur_w / 2, qy - cur_h / 2, cur_w, cur_h, 2, p_colors[p]);
+
+                    /* Identificador de jogador */
+                    if (cur_w >= 180) {
+                        ui_draw_text(fb, qx - 16, qy - 12, p_tags[p], p_colors[p], 3);
+                        ui_draw_text(fb, qx - 40, qy + 24, "GBA SCREEN", 0xFF8D99AEU, 1);
+                    }
+                }
+            }
+        }
+
+        /* Cabo de circuito eletrico azul neon (Link Cable 4-Way Virtual) */
+        if (frame >= 68) {
+            /* Hub central de conexao */
+            int hub_size = 24;
+            draw_rect_solid(fb, cx - hub_size / 2, cy - hub_size / 2, hub_size, hub_size, COLOR_SPLASH_CYAN);
+            draw_rect_border(fb, cx - hub_size / 2, cy - hub_size / 2, hub_size, hub_size, 2, 0xFFFFFFFFU);
+
+            /* Tracado eletrico para cada mini tela */
+            draw_circuit_line(fb, cx, cy, 480, 480, 370, COLOR_SPLASH_CYAN);
+            draw_circuit_line(fb, cx, cy, 1440, 1440, 370, COLOR_SPLASH_CYAN);
+            draw_circuit_line(fb, cx, cy, 480, 480, 710, COLOR_SPLASH_CYAN);
+            draw_circuit_line(fb, cx, cy, 1440, 1440, 710, COLOR_SPLASH_CYAN);
+
+            /* Pacotes eletricos em transito simulando o Link Cable Ring Buffer */
+            int pkt_offset = ((frame - 68) * 16) % 480;
+            draw_rect_solid(fb, cx - pkt_offset, cy - 1, 6, 3, 0xFFFFFFFFU);
+            draw_rect_solid(fb, cx + pkt_offset, cy - 1, 6, 3, 0xFFFFFFFFU);
+        }
+    }
+
+    /* --------------------------------------------------------------------------
+     * IDLE EFFECT 1: Luz Percorrendo as Linhas / Telas (Running Light)
+     * -------------------------------------------------------------------------- */
+    if (frame >= 90) {
+        /* Ponto luminoso contínuo nas bordas das 4 mini-telas */
+        int quad_pos[4][2] = {
+            { 480, 270 }, { 1440, 270 }, { 480, 810 }, { 1440, 810 }
+        };
+        int peri = 2 * (270 + 180); /* 900 pixels */
+        int base_run = ((frame - 90) * 6) % peri;
+
+        for (int p = 0; p < 4; ++p) {
+            int qx0 = quad_pos[p][0] - 135;
+            int qy0 = quad_pos[p][1] - 90;
+            int p_run = (base_run + p * 225) % peri;
+
+            for (int b = 0; b < 10; ++b) {
+                int st = (p_run - b + peri) % peri;
+                int lx, ly;
+                if (st < 270) {
+                    lx = qx0 + st;
+                    ly = qy0;
+                } else if (st < 450) {
+                    lx = qx0 + 270;
+                    ly = qy0 + (st - 270);
+                } else if (st < 720) {
+                    lx = qx0 + 270 - (st - 450);
+                    ly = qy0 + 180;
+                } else {
+                    lx = qx0;
+                    ly = qy0 + 180 - (st - 720);
+                }
+
+                uint32_t spark_col = (b == 0) ? 0xFFFFFFFFU : 0xFFE0FFFFU;
+                if (lx >= 0 && lx < PS4_SCREEN_WIDTH && ly >= 0 && ly < PS4_SCREEN_HEIGHT) {
+                    fb[ly * PS4_SCREEN_WIDTH + lx] = spark_col;
+                    if (st < 270 || (st >= 450 && st < 720)) {
+                        if (ly + 1 < PS4_SCREEN_HEIGHT) fb[(ly + 1) * PS4_SCREEN_WIDTH + lx] = spark_col;
+                    } else {
+                        if (lx + 1 < PS4_SCREEN_WIDTH) fb[ly * PS4_SCREEN_WIDTH + lx + 1] = spark_col;
+                    }
+                }
+            }
+        }
+
+        /* Feixe elétrico percorrendo a cruz central */
+        int v_run = ((frame - 90) * 8) % PS4_SCREEN_HEIGHT;
+        draw_rect_solid(fb, cx - 1, v_run, 2, 10, 0xFFE0FFFFU);
+        draw_rect_solid(fb, cx - 1, (v_run + 8) % PS4_SCREEN_HEIGHT, 2, 2, 0xFFFFFFFFU);
+
+        int h_run = ((frame - 90) * 12) % PS4_SCREEN_WIDTH;
+        draw_rect_solid(fb, h_run, cy - 1, 10, 2, 0xFFE0FFFFU);
+        draw_rect_solid(fb, (h_run + 8) % PS4_SCREEN_WIDTH, cy - 1, 2, 2, 0xFFFFFFFFU);
+    }
+
+    /* --------------------------------------------------------------------------
+     * FASE 3 (Fotogramas 85 a 140): Formacao da Marca PSgba
+     * -------------------------------------------------------------------------- */
+    if (frame >= 85) {
+        int banner_w = 780;
+        int banner_h = 96;
+        int banner_x = cx - banner_w / 2;
+        int banner_y = 50;
+
+        /* Caixa superior do logotipo */
+        draw_rect_solid(fb, banner_x, banner_y, banner_w, banner_h, 0xFF080F1EU);
+        draw_rect_border(fb, banner_x, banner_y, banner_w, banner_h, 2, COLOR_PS_NEON_BLUE);
+        draw_rect_border(fb, banner_x + 4, banner_y + 4, banner_w - 8, banner_h - 8, 1, 0xFF1D3557U);
+
+        if (frame < 110) {
+            /* Transicao com integracao do "4": "PS4GBA" */
+            ui_draw_text(fb, cx - 110, banner_y + 16, "PS", 0xFFFFFFFFU, 4);
+            uint32_t four_col = ((frame / 4) % 2 == 0) ? COLOR_TEXT_GOLD : COLOR_SPLASH_CYAN;
+            ui_draw_text(fb, cx - 46, banner_y + 16, "4", four_col, 4);
+            ui_draw_text(fb, cx - 14, banner_y + 16, "GBA", COLOR_SPLASH_CYAN, 4);
+
+            ui_draw_text(fb, cx - 136, banner_y + 64, "CONECTANDO 4 JOGADORES...", 0xFF8D99AEU, 2);
+        } else {
+            /* Nome oficial consolidado: "PSgba" */
+            ui_draw_text(fb, cx - 80, banner_y + 16, "PS", COLOR_PS_NEON_BLUE, 4);
+            ui_draw_text(fb, cx - 16, banner_y + 16, "gba", COLOR_TEXT_GOLD, 4);
+
+            /* Subtitulo em Amarelo Dourado */
+            ui_draw_text(fb, cx - 216, banner_y + 64, "4-WAY SPLIT-SCREEN EMULATOR", COLOR_TEXT_GOLD, 2);
+        }
+    }
+
+    /* --------------------------------------------------------------------------
+     * FASE 4 (Fotogramas 100+): Creditos dos Criadores & Efeito Shimmer
+     * -------------------------------------------------------------------------- */
+    if (frame >= 100) {
+        int cred_w = 640;
+        int cred_h = 76;
+        int cred_x = cx - cred_w / 2;
+        int cred_y = 880;
+
+        draw_rect_solid(fb, cred_x, cred_y, cred_w, cred_h, 0xFF080F1EU);
+        draw_rect_border(fb, cred_x, cred_y, cred_w, cred_h, 2, COLOR_SPLASH_CYAN);
+        draw_rect_border(fb, cred_x + 3, cred_y + 3, cred_w - 6, cred_h - 6, 1, 0xFF1D3557U);
+
+        /* Texto guia superior */
+        ui_draw_text(fb, cx - 60, cred_y + 14, "DESENVOLVIDO POR", 0xFF8899AAU, 1);
+
+        /* Nomes em destaque: felipecjb (Azul P1) x nsu-duxs (Vermelho P2) */
+        int names_x = cx - 160;
+        int names_y = cred_y + 38;
+
+        ui_draw_text(fb, names_x, names_y, "felipecjb", COLOR_PS_NEON_BLUE, 2);
+        ui_draw_text(fb, names_x + 144, names_y, " x ", 0xFFFFFFFFU, 2);
+        ui_draw_text(fb, names_x + 192, names_y, "nsu-duxs", 0xFFEE5253U, 2);
+
+        /* IDLE EFFECT 2: Brilho Metalico / Shimmer nos Nomes dos Criadores
+         * Feixe luminoso translúcido que varre suavemente a caixa a cada 2.5s (150 frames) */
+        int shim_cycle = 150;
+        int shim_t = (frame - 100) % shim_cycle;
+        if (shim_t < 50) {
+            /* SFX 3: Cintilacao suave ~2.4kHz ao passar sobre os nomes dos criadores (Fotograma ~120 / loop) */
+            if (shim_t == 20) {
+                audio_play_splash_sfx(SPLASH_SFX_SHIMMER);
+            }
+
+            int sweep_x = cred_x + (shim_t * (cred_w + 60)) / 50 - 30;
+            int half_w = 6;
+
+            for (int sy = cred_y + 4; sy < cred_y + cred_h - 4; ++sy) {
+                int sx_center = sweep_x + ((sy - cred_y) * 12) / cred_h;
+
+                for (int dx = -half_w; dx <= half_w; ++dx) {
+                    int px = sx_center + dx;
+                    if (px >= cred_x + 4 && px < cred_x + cred_w - 4) {
+                        int p_idx = sy * PS4_SCREEN_WIDTH + px;
+                        uint32_t orig = fb[p_idx];
+
+                        int boost = (half_w + 1 - abs(dx)) * 14; /* 14 a 98 */
+                        uint32_t r = ((orig >> 16) & 0xFF) + boost;
+                        uint32_t g = ((orig >> 8) & 0xFF) + boost;
+                        uint32_t b = (orig & 0xFF) + boost;
+
+                        if (r > 255) r = 255;
+                        if (g > 255) g = 255;
+                        if (b > 255) b = 255;
+
+                        fb[p_idx] = 0xFF000000U | (r << 16) | (g << 8) | b;
+                    }
+                }
+            }
+        }
+    }
+
+    /* --------------------------------------------------------------------------
+     * FASE 5 (Fotogramas 165+): Moldura Exterior Estável
+     * -------------------------------------------------------------------------- */
+    if (frame >= 165) {
+        draw_rect_border(fb, 40, 24, PS4_SCREEN_WIDTH - 80, PS4_SCREEN_HEIGHT - 48, 3, COLOR_BORDER_BLUE);
+    }
+
+    /* --------------------------------------------------------------------------
+     * INTERAÇÃO & TEXTO RETRÔ PULSANTE / SALTITANTE (TITLE SCREEN)
+     * -------------------------------------------------------------------------- */
+    if (frame < 180) {
+        /* Dica discreta no rodapé durante a animação inicial */
+        ui_draw_text(fb, cx - 76, 1044, "[X / OPTIONS] Pular", 0xFF8D99AEU, 1);
+    } else {
+        /* Title Screen Interativa: Espera por qualquer botão do DualShock 4 */
+        int offset_y = (int)(sinf((float)s_splash_frame * 0.1f) * 4.0f);
+        uint32_t prompt_color = ((s_splash_frame / 30) % 2 == 0) ? COLOR_TEXT_GOLD : COLOR_TEXT_WHITE;
+
+        /* Centralizado perfeitamente: 34 chars * 16px = 544px -> X = 960 - 272 = 688.
+         * Y = 990 + offset_y fica entre a caixa de créditos (Y=956) e a borda inferior (Y=1056). */
+        ui_draw_text(fb, 688, 990 + offset_y, "Aperte qualquer botao para comecar", prompt_color, 2);
+    }
+
+    /* Avanço contínuo do fotograma (loop infinito de animação idle na Title Screen) */
+    s_splash_frame++;
+}
+
+/* ==============================================================================
  * LOGICA DE ATUALIZACAO DO LAUNCHER (ZERO DISK ACCESS)
  * ============================================================================== */
 
@@ -1164,22 +1548,26 @@ void ui_menu_update_launcher(struct PS4GBA_Context* ctx, uint32_t buttons_presse
     if (s_launcher_tab == LAUNCHER_TAB_CONTROLS) {
         if (buttons_pressed & ORBIS_PAD_BUTTON_TOUCH_PAD) {
             s_controls_view_gba = !s_controls_view_gba;
+            audio_play_sfx(UI_SFX_TOUCHPAD);
             return;
         }
     } else {
         /* Nas demais abas, Touchpad alterna o painel lateral de detalhes/ajuda */
         if (buttons_pressed & ORBIS_PAD_BUTTON_TOUCH_PAD) {
             s_show_side_panel = !s_show_side_panel;
+            audio_play_sfx(UI_SFX_TOUCHPAD);
         }
     }
 
     /* Troca de abas via L1 / R1 */
     if (buttons_pressed & ORBIS_PAD_BUTTON_L1) {
         s_launcher_tab = (s_launcher_tab - 1 + LAUNCHER_TAB_COUNT) % LAUNCHER_TAB_COUNT;
+        audio_play_sfx(UI_SFX_TAB_SWITCH);
         return;
     }
     if (buttons_pressed & ORBIS_PAD_BUTTON_R1) {
         s_launcher_tab = (s_launcher_tab + 1) % LAUNCHER_TAB_COUNT;
+        audio_play_sfx(UI_SFX_TAB_SWITCH);
         return;
     }
 
@@ -1216,6 +1604,7 @@ void ui_menu_update_launcher(struct PS4GBA_Context* ctx, uint32_t buttons_presse
         }
 
         if ((buttons_pressed & ORBIS_PAD_BUTTON_CROSS) && s_rom_count > 0) {
+            audio_play_sfx(UI_SFX_CONFIRM);
             if (s_launcher_rom_cursor >= 0 && s_launcher_rom_cursor < s_rom_count) {
                 const char* path = s_rom_paths[s_launcher_rom_cursor];
                 const char* paths[GBA_MAX_INSTANCES] = { path, path, path, path };
@@ -1223,6 +1612,7 @@ void ui_menu_update_launcher(struct PS4GBA_Context* ctx, uint32_t buttons_presse
                 if (ok) {
                     s_launcher_status[0] = '\0';
                     s_app_state = UI_STATE_INGAME;
+                    audio_stop_splash_sfx();
                     ui_menu_trigger_join_hint();
                 } else {
                     snprintf(s_launcher_status, sizeof(s_launcher_status),
@@ -1242,6 +1632,11 @@ void ui_menu_update_launcher(struct PS4GBA_Context* ctx, uint32_t buttons_presse
         bool trigger = (buttons_pressed & (ORBIS_PAD_BUTTON_LEFT | ORBIS_PAD_BUTTON_RIGHT | ORBIS_PAD_BUTTON_CROSS));
 
         if (trigger) {
+            if (buttons_pressed & ORBIS_PAD_BUTTON_CROSS) {
+                audio_play_sfx(UI_SFX_CONFIRM);
+            } else {
+                audio_play_sfx(UI_SFX_VALUE_CHANGE);
+            }
             switch (s_launcher_va_cursor) {
             case LAUNCHER_VA_DISPLAY:
                 video_cycle_display_mode(delta);
@@ -1269,6 +1664,9 @@ void ui_menu_update_launcher(struct PS4GBA_Context* ctx, uint32_t buttons_presse
                     audio_set_mode(PS4_AUDIO_MODE_MIX);
                 }
                 break;
+            case LAUNCHER_VA_MENU_SFX:
+                audio_set_menu_sfx_enabled(!audio_is_menu_sfx_enabled());
+                break;
             default:
                 break;
             }
@@ -1276,6 +1674,7 @@ void ui_menu_update_launcher(struct PS4GBA_Context* ctx, uint32_t buttons_presse
     } else if (s_launcher_tab == LAUNCHER_TAB_CONTROLS) {
         if (buttons_pressed & ORBIS_PAD_BUTTON_CIRCLE) {
             s_launcher_tab = LAUNCHER_TAB_GAMES;
+            audio_play_sfx(UI_SFX_TAB_SWITCH);
         }
     }
 }
@@ -1287,6 +1686,7 @@ void ui_menu_update_launcher(struct PS4GBA_Context* ctx, uint32_t buttons_presse
 void ui_menu_update_osd(struct PS4GBA_Context* ctx, uint32_t buttons_pressed) {
     if (buttons_pressed & (ORBIS_PAD_BUTTON_OPTIONS | ORBIS_PAD_BUTTON_CIRCLE)) {
         s_app_state = UI_STATE_INGAME;
+        audio_play_sfx(UI_SFX_CONFIRM);
         return;
     }
 
@@ -1294,21 +1694,25 @@ void ui_menu_update_osd(struct PS4GBA_Context* ctx, uint32_t buttons_pressed) {
     if (s_osd_tab == OSD_TAB_CONTROLS) {
         if (buttons_pressed & ORBIS_PAD_BUTTON_TOUCH_PAD) {
             s_controls_view_gba = !s_controls_view_gba;
+            audio_play_sfx(UI_SFX_TOUCHPAD);
             return;
         }
     } else {
         /* Nas demais abas, Touchpad alterna o painel lateral de detalhes/ajuda */
         if (buttons_pressed & ORBIS_PAD_BUTTON_TOUCH_PAD) {
             s_show_side_panel = !s_show_side_panel;
+            audio_play_sfx(UI_SFX_TOUCHPAD);
         }
     }
 
     if (buttons_pressed & ORBIS_PAD_BUTTON_L1) {
         s_osd_tab = (s_osd_tab - 1 + OSD_TAB_COUNT) % OSD_TAB_COUNT;
+        audio_play_sfx(UI_SFX_TAB_SWITCH);
         return;
     }
     if (buttons_pressed & ORBIS_PAD_BUTTON_R1) {
         s_osd_tab = (s_osd_tab + 1) % OSD_TAB_COUNT;
+        audio_play_sfx(UI_SFX_TAB_SWITCH);
         return;
     }
 
@@ -1321,6 +1725,7 @@ void ui_menu_update_osd(struct PS4GBA_Context* ctx, uint32_t buttons_pressed) {
         }
 
         if (buttons_pressed & ORBIS_PAD_BUTTON_CROSS) {
+            audio_play_sfx(UI_SFX_CONFIRM);
             switch (s_osd_saves_cursor) {
             case OSD_SAVE_RESUME:
                 s_app_state = UI_STATE_INGAME;
@@ -1374,6 +1779,11 @@ void ui_menu_update_osd(struct PS4GBA_Context* ctx, uint32_t buttons_pressed) {
         bool trigger = (buttons_pressed & (ORBIS_PAD_BUTTON_LEFT | ORBIS_PAD_BUTTON_RIGHT | ORBIS_PAD_BUTTON_CROSS));
 
         if (trigger) {
+            if (buttons_pressed & ORBIS_PAD_BUTTON_CROSS) {
+                audio_play_sfx(UI_SFX_CONFIRM);
+            } else {
+                audio_play_sfx(UI_SFX_VALUE_CHANGE);
+            }
             switch (s_osd_cfg_cursor) {
             case OSD_CFG_DISPLAY:
                 video_cycle_display_mode(delta);
@@ -1410,6 +1820,9 @@ void ui_menu_update_osd(struct PS4GBA_Context* ctx, uint32_t buttons_pressed) {
                 }
                 break;
             }
+            case OSD_CFG_MENU_SFX:
+                audio_set_menu_sfx_enabled(!audio_is_menu_sfx_enabled());
+                break;
             default:
                 break;
             }
@@ -1424,6 +1837,11 @@ void ui_menu_update_osd(struct PS4GBA_Context* ctx, uint32_t buttons_pressed) {
 
         bool trigger = (buttons_pressed & (ORBIS_PAD_BUTTON_LEFT | ORBIS_PAD_BUTTON_RIGHT | ORBIS_PAD_BUTTON_CROSS));
         if (trigger) {
+            if (buttons_pressed & ORBIS_PAD_BUTTON_CROSS) {
+                audio_play_sfx(UI_SFX_CONFIRM);
+            } else {
+                audio_play_sfx(UI_SFX_VALUE_CHANGE);
+            }
             if (s_osd_link_cursor == OSD_LINK_POWER) {
                 bool next_state = !link_hub_is_cable_enabled();
                 link_hub_set_cable_enabled(next_state);
@@ -1465,7 +1883,7 @@ void ui_menu_render_launcher(uint32_t* fb) {
     draw_rect_border(fb, 40, 24, PS4_SCREEN_WIDTH - 80, PS4_SCREEN_HEIGHT - 48, 3, COLOR_BORDER_CYAN);
     draw_rect_border(fb, 46, 30, PS4_SCREEN_WIDTH - 92, PS4_SCREEN_HEIGHT - 60, 1, COLOR_BORDER_INNER);
 
-    ui_draw_text(fb, 70, 44, "PSgba - GBA 4-WAY SPLIT-SCREEN EMULATOR v1.07", COLOR_TEXT_GOLD, 3);
+    ui_draw_text(fb, 70, 44, "PSgba - GBA 4-WAY SPLIT-SCREEN EMULATOR v1.08", COLOR_TEXT_GOLD, 3);
 
     const char* tabs[LAUNCHER_TAB_COUNT] = {
         "[ JOGOS ]",
@@ -1572,7 +1990,7 @@ void ui_menu_render_launcher(uint32_t* fb) {
         draw_rect_solid(fb, left_x + 20, left_y + 86, left_w - 40, 1, COLOR_BORDER_INNER);
 
         char opt_display[160], opt_filter[160], opt_scale[160], opt_smooth[160];
-        char opt_fps[160], opt_fps_limit[160], opt_audio[160];
+        char opt_fps[160], opt_fps_limit[160], opt_audio[160], opt_sfx[160];
 
         snprintf(opt_display, sizeof(opt_display), "Proporcao da Tela: < %s >",
                  video_get_display_mode_name(video_get_display_mode()));
@@ -1591,18 +2009,20 @@ void ui_menu_render_launcher(uint32_t* fb) {
                                      ? "Mix Todas as Telas"
                                      : "Foco P1";
         snprintf(opt_audio, sizeof(opt_audio), "Audio: < %s >", audio_name);
+        snprintf(opt_sfx, sizeof(opt_sfx), "Sons do Menu: < %s >",
+                 audio_is_menu_sfx_enabled() ? "LIGADO" : "DESLIGADO");
 
         const char* opts[LAUNCHER_VA_COUNT] = {
-            opt_display, opt_filter, opt_scale, opt_smooth, opt_fps, opt_fps_limit, opt_audio
+            opt_display, opt_filter, opt_scale, opt_smooth, opt_fps, opt_fps_limit, opt_audio, opt_sfx
         };
 
         for (int i = 0; i < LAUNCHER_VA_COUNT; ++i) {
             bool is_sel = (s_launcher_va_cursor == i);
-            int row_y = left_y + 114 + i * 68;
+            int row_y = left_y + 104 + i * 64;
 
             if (is_sel) {
-                draw_rect_solid(fb, left_x + 20, row_y - 6, left_w - 40, 52, COLOR_ITEM_SEL_BG);
-                draw_rect_border(fb, left_x + 20, row_y - 6, left_w - 40, 52, 1, COLOR_BORDER_CYAN);
+                draw_rect_solid(fb, left_x + 20, row_y - 6, left_w - 40, 50, COLOR_ITEM_SEL_BG);
+                draw_rect_border(fb, left_x + 20, row_y - 6, left_w - 40, 50, 1, COLOR_BORDER_CYAN);
             }
 
             char line[200];
@@ -1667,6 +2087,12 @@ void ui_menu_render_launcher(uint32_t* fb) {
                 ui_draw_text_wrapped(fb, side_x + 24, ty,
                                      "Mix: Mistura o som de todos os jogadores ativos (25% cada).\n\n"
                                      "Foco: Concentra 100% do volume na tela do Jogador 1 (atalho L3+R3).",
+                                     COLOR_TEXT_WHITE, 2, side_w - 48, 24);
+                break;
+            case LAUNCHER_VA_MENU_SFX:
+                ui_draw_text(fb, side_x + 24, ty, "SONS DA INTERFACE:", COLOR_BORDER_CYAN, 2); ty += 36;
+                ui_draw_text_wrapped(fb, side_x + 24, ty,
+                                     "Ativa ou desativa os efeitos sonoros ao navegar pelas abas e opcoes dos menus. O audio do jogo em execucao continua funcionando normalmente.",
                                      COLOR_TEXT_WHITE, 2, side_w - 48, 24);
                 break;
             default:
@@ -1816,7 +2242,7 @@ void ui_menu_render_osd(uint32_t* fb, struct PS4GBA_Context* ctx) {
         draw_rect_solid(fb, left_x + 20, left_y + 56, left_w - 40, 1, COLOR_BORDER_INNER);
 
         char item_display[140], item_filter[140], item_scale[140], item_smooth[140];
-        char item_fps[140], item_fps_limit[140], item_audio[140];
+        char item_fps[140], item_fps_limit[140], item_audio[140], item_sfx[140];
 
         snprintf(item_display, sizeof(item_display), "Proporcao da Tela: < %s >",
                  video_get_display_mode_name(video_get_display_mode()));
@@ -1840,18 +2266,20 @@ void ui_menu_render_osd(uint32_t* fb, struct PS4GBA_Context* ctx) {
                      audio_get_focus_player() + 1);
         }
         snprintf(item_audio, sizeof(item_audio), "Audio dos Jogadores: < %s >", focus_label);
+        snprintf(item_sfx, sizeof(item_sfx), "Sons do Menu: < %s >",
+                 audio_is_menu_sfx_enabled() ? "LIGADO" : "DESLIGADO");
 
         const char* cfg_items[OSD_CFG_COUNT] = {
-            item_display, item_filter, item_scale, item_smooth, item_fps, item_fps_limit, item_audio
+            item_display, item_filter, item_scale, item_smooth, item_fps, item_fps_limit, item_audio, item_sfx
         };
 
         for (int i = 0; i < OSD_CFG_COUNT; ++i) {
             bool is_sel = (s_osd_cfg_cursor == i);
-            int row_y = left_y + 80 + i * 78;
+            int row_y = left_y + 72 + i * 68;
 
             if (is_sel) {
-                draw_rect_solid(fb, left_x + 20, row_y - 6, left_w - 40, 52, COLOR_ITEM_SEL_BG);
-                draw_rect_border(fb, left_x + 20, row_y - 6, left_w - 40, 52, 1, COLOR_BORDER_CYAN);
+                draw_rect_solid(fb, left_x + 20, row_y - 6, left_w - 40, 48, COLOR_ITEM_SEL_BG);
+                draw_rect_border(fb, left_x + 20, row_y - 6, left_w - 40, 48, 1, COLOR_BORDER_CYAN);
             }
 
             char line[200];
@@ -1900,6 +2328,9 @@ void ui_menu_render_osd(uint32_t* fb, struct PS4GBA_Context* ctx) {
                 break;
             case OSD_CFG_AUDIO_FOCUS:
                 ui_draw_text_wrapped(fb, side_x + 24, ty, "Alterna audio entre mix geral e foco isolado em uma das telas.", COLOR_TEXT_LIGHT, 2, side_w - 48, 22);
+                break;
+            case OSD_CFG_MENU_SFX:
+                ui_draw_text_wrapped(fb, side_x + 24, ty, "Ativa ou desativa os efeitos sonoros ao navegar pelas abas e opcoes dos menus. O audio do jogo em execucao continua funcionando normalmente.", COLOR_TEXT_LIGHT, 2, side_w - 48, 22);
                 break;
             default:
                 break;
