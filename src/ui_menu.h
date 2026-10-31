@@ -27,11 +27,12 @@ typedef enum LauncherTab {
 
 typedef enum OsdTab {
     OSD_TAB_SAVES = 0,
-    OSD_TAB_VIDEO_AUDIO = 1,
-    OSD_TAB_SETTINGS = 1, /* Alias de compatibilidade */
-    OSD_TAB_LINK_CABLE = 2,
-    OSD_TAB_CONTROLS = 3,
-    OSD_TAB_COUNT = 4
+    OSD_TAB_CHEATS = 1,
+    OSD_TAB_VIDEO_AUDIO = 2,
+    OSD_TAB_SETTINGS = 2, /* Alias de compatibilidade */
+    OSD_TAB_LINK_CABLE = 3,
+    OSD_TAB_CONTROLS = 4,
+    OSD_TAB_COUNT = 5
 } OsdTab;
 
 void ui_menu_init(void);

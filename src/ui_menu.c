@@ -100,6 +100,10 @@ enum {
 };
 
 #define ROM_PAGE_SIZE 12
+#define CHEAT_PAGE_SIZE 12
+
+static int s_osd_cheat_cursor = 0;
+static int s_osd_cheat_scroll = 0;
 
 static UIAppState s_app_state = UI_STATE_SPLASH;
 static int s_splash_frame = 0;
@@ -361,10 +365,10 @@ static void draw_tab_bar(uint32_t* fb, int x, int y, int total_w, const char* ta
         return;
     }
 
-    int btn_w = 84;
+    int btn_w = (count >= 5) ? 76 : 84;
     int btn_h = 36;
     int tab_h = 36;
-    int gap = 10;
+    int gap = (count >= 5) ? 8 : 10;
 
     /* Botao [L1] alinhado a esquerda com texto rigorosamente centralizado */
     draw_rect_solid(fb, x, y, btn_w, btn_h, 0xFF1E293BU);
@@ -402,10 +406,18 @@ static void draw_tab_bar(uint32_t* fb, int x, int y, int total_w, const char* ta
         int text_px = text_len * 16;
         int tx = cur_x + (tab_w - text_px) / 2;
         int ty = y + (tab_h - 16) / 2;
-        if (tx < cur_x + 4) {
-            tx = cur_x + 4;
+        if (text_px <= tab_w - 8) {
+            ui_draw_text(fb, tx, ty, tabs[i], txt, 2);
+        } else {
+            /* Compacta proporcionalmente para caber 100% no retangulo da aba sem "..." */
+            int step = (tab_w - 16) / text_len;
+            if (step < 8) step = 8;
+            int start_x = cur_x + (tab_w - (text_len * step)) / 2;
+            for (int ch = 0; ch < text_len; ++ch) {
+                char single[2] = { tabs[i][ch], '\0' };
+                ui_draw_text(fb, start_x + ch * step, ty, single, txt, 2);
+            }
         }
-        ui_draw_text_truncated(fb, tx, ty, tabs[i], txt, 2, tab_w - 8);
 
         cur_x += tab_w + gap;
     }
@@ -1094,10 +1106,19 @@ void ui_menu_open_osd(int trigger_player) {
     s_osd_player = (trigger_player >= 0 && trigger_player < GBA_MAX_INSTANCES) ? trigger_player : 0;
     s_osd_tab = OSD_TAB_SAVES;
     s_osd_saves_cursor = 0;
+    s_osd_cheat_cursor = 0;
+    s_osd_cheat_scroll = 0;
     s_osd_status[0] = '\0';
     s_controls_view_gba = false;
     s_app_state = UI_STATE_OSD;
     audio_play_sfx(UI_SFX_CONFIRM);
+
+    /* Tenta carregar trapaças para o jogador caso ainda nao tenham sido carregadas */
+    const char* rpath = g_gba_ctx.instances[s_osd_player].rom_path;
+    if (!rpath || !*rpath) rpath = g_gba_ctx.rom_path;
+    if (!emulator_has_cheat_file(s_osd_player) && rpath && *rpath) {
+        emulator_load_cheats(s_osd_player, rpath);
+    }
 }
 
 bool ui_menu_is_osd_open(void) {
@@ -1878,11 +1899,25 @@ void ui_menu_update_osd(struct PS4GBA_Context* ctx, uint32_t buttons_pressed) {
 
     if (buttons_pressed & ORBIS_PAD_BUTTON_L1) {
         s_osd_tab = (s_osd_tab - 1 + OSD_TAB_COUNT) % OSD_TAB_COUNT;
+        if (s_osd_tab == OSD_TAB_CHEATS && !emulator_has_cheat_file(s_osd_player)) {
+            const char* ppath = ctx->instances[s_osd_player].rom_path;
+            if (!ppath || !*ppath) ppath = ctx->rom_path;
+            if (ppath && *ppath) {
+                emulator_load_cheats(s_osd_player, ppath);
+            }
+        }
         audio_play_sfx(UI_SFX_TAB_SWITCH);
         return;
     }
     if (buttons_pressed & ORBIS_PAD_BUTTON_R1) {
         s_osd_tab = (s_osd_tab + 1) % OSD_TAB_COUNT;
+        if (s_osd_tab == OSD_TAB_CHEATS && !emulator_has_cheat_file(s_osd_player)) {
+            const char* ppath = ctx->instances[s_osd_player].rom_path;
+            if (!ppath || !*ppath) ppath = ctx->rom_path;
+            if (ppath && *ppath) {
+                emulator_load_cheats(s_osd_player, ppath);
+            }
+        }
         audio_play_sfx(UI_SFX_TAB_SWITCH);
         return;
     }
@@ -1936,6 +1971,78 @@ void ui_menu_update_osd(struct PS4GBA_Context* ctx, uint32_t buttons_pressed) {
                 break;
             default:
                 break;
+            }
+        }
+    } else if (s_osd_tab == OSD_TAB_CHEATS) {
+        if (buttons_pressed & ORBIS_PAD_BUTTON_TRIANGLE) {
+            const char* ppath = ctx->instances[s_osd_player].rom_path;
+            if (!ppath || !*ppath) ppath = ctx->rom_path;
+            if (ppath && *ppath) {
+                if (emulator_load_cheats(s_osd_player, ppath)) {
+                    s_osd_cheat_cursor = 0;
+                    s_osd_cheat_scroll = 0;
+                    snprintf(s_osd_status, sizeof(s_osd_status), "P%d: %d trapaca(s) recarregada(s)!",
+                             s_osd_player + 1, emulator_get_cheat_count(s_osd_player));
+                    audio_play_sfx(UI_SFX_CONFIRM);
+                } else {
+                    snprintf(s_osd_status, sizeof(s_osd_status), "P%d: %s",
+                             s_osd_player + 1, emulator_get_cheat_status(s_osd_player));
+                    audio_play_sfx(UI_SFX_VALUE_CHANGE);
+                }
+            }
+        }
+        int total_cheats = emulator_get_cheat_count(s_osd_player);
+        if (total_cheats > 0) {
+            if (buttons_pressed & ORBIS_PAD_BUTTON_UP) {
+                if (s_osd_cheat_cursor > 0) {
+                    s_osd_cheat_cursor--;
+                } else {
+                    s_osd_cheat_cursor = total_cheats - 1;
+                }
+                audio_play_sfx(UI_SFX_VALUE_CHANGE);
+            }
+            if (buttons_pressed & ORBIS_PAD_BUTTON_DOWN) {
+                if (s_osd_cheat_cursor + 1 < total_cheats) {
+                    s_osd_cheat_cursor++;
+                } else {
+                    s_osd_cheat_cursor = 0;
+                }
+                audio_play_sfx(UI_SFX_VALUE_CHANGE);
+            }
+
+            if (buttons_pressed & (ORBIS_PAD_BUTTON_LEFT | ORBIS_PAD_BUTTON_L2)) {
+                s_osd_cheat_cursor -= CHEAT_PAGE_SIZE;
+                if (s_osd_cheat_cursor < 0) {
+                    s_osd_cheat_cursor = 0;
+                }
+                audio_play_sfx(UI_SFX_VALUE_CHANGE);
+            }
+            if (buttons_pressed & (ORBIS_PAD_BUTTON_RIGHT | ORBIS_PAD_BUTTON_R2)) {
+                s_osd_cheat_cursor += CHEAT_PAGE_SIZE;
+                if (s_osd_cheat_cursor >= total_cheats) {
+                    s_osd_cheat_cursor = total_cheats - 1;
+                }
+                audio_play_sfx(UI_SFX_VALUE_CHANGE);
+            }
+
+            if (s_osd_cheat_cursor < s_osd_cheat_scroll) {
+                s_osd_cheat_scroll = s_osd_cheat_cursor;
+            }
+            if (s_osd_cheat_cursor >= s_osd_cheat_scroll + CHEAT_PAGE_SIZE) {
+                s_osd_cheat_scroll = s_osd_cheat_cursor - CHEAT_PAGE_SIZE + 1;
+            }
+
+            if (buttons_pressed & ORBIS_PAD_BUTTON_CROSS) {
+                emulator_toggle_cheat(s_osd_player, s_osd_cheat_cursor);
+                bool now_en = emulator_is_cheat_enabled(s_osd_player, s_osd_cheat_cursor);
+                int n_codes = emulator_get_cheat_code_count(s_osd_player, s_osd_cheat_cursor);
+                bool is_m = emulator_is_cheat_master(s_osd_player, s_osd_cheat_cursor);
+                snprintf(s_osd_status, sizeof(s_osd_status), "P%d: %s [%s] (%d opcodes%s)",
+                         s_osd_player + 1,
+                         emulator_get_cheat_name(s_osd_player, s_osd_cheat_cursor),
+                         now_en ? "ATIVADO" : "DESATIVADO",
+                         n_codes, is_m ? " - Master" : "");
+                audio_play_sfx(UI_SFX_CONFIRM);
             }
         }
     } else if (s_osd_tab == OSD_TAB_VIDEO_AUDIO) {
@@ -2054,7 +2161,7 @@ void ui_menu_render_launcher(uint32_t* fb) {
     draw_rect_border(fb, 40, 24, PS4_SCREEN_WIDTH - 80, PS4_SCREEN_HEIGHT - 48, 3, COLOR_BORDER_CYAN);
     draw_rect_border(fb, 46, 30, PS4_SCREEN_WIDTH - 92, PS4_SCREEN_HEIGHT - 60, 1, COLOR_BORDER_INNER);
 
-    ui_draw_text(fb, 70, 44, "PSgba - GBA 4-WAY SPLIT-SCREEN EMULATOR v1.08", COLOR_TEXT_GOLD, 3);
+    ui_draw_text(fb, 70, 44, "PSgba - GBA 4-WAY SPLIT-SCREEN EMULATOR v1.09", COLOR_TEXT_GOLD, 3);
 
     const char* tabs[LAUNCHER_TAB_COUNT] = {
         "[ JOGOS ]",
@@ -2332,6 +2439,7 @@ void ui_menu_render_osd(uint32_t* fb, struct PS4GBA_Context* ctx) {
 
     const char* osd_tabs[OSD_TAB_COUNT] = {
         "[ JOGO & SAVES ]",
+        "[ TRAPACAS / CHEATS ]",
         "[ VIDEO & AUDIO ]",
         "[ LINK CABLE ]",
         "[ CONTROLES ]"
@@ -2350,6 +2458,183 @@ void ui_menu_render_osd(uint32_t* fb, struct PS4GBA_Context* ctx) {
     int left_y = box_y + 130;
     int left_h = 740;
     int side_x = left_x + left_w + gap;
+
+    if (s_osd_tab == OSD_TAB_CHEATS) {
+        draw_box_rpg(fb, left_x, left_y, left_w, left_h, COLOR_BG, COLOR_BORDER_BLUE);
+        ui_draw_text(fb, left_x + 30, left_y + 24, "TRAPACAS & CHEATS (ACTION REPLAY / GAMESHARK)", COLOR_TEXT_GOLD, 2);
+        draw_rect_solid(fb, left_x + 20, left_y + 56, left_w - 40, 1, COLOR_BORDER_INNER);
+
+        bool has_file = emulator_has_cheat_file(s_osd_player);
+        int total_cheats = emulator_get_cheat_count(s_osd_player);
+
+        if (!has_file || total_cheats == 0) {
+            int msg_y = left_y + 120;
+            draw_box_rpg(fb, left_x + 30, msg_y, left_w - 60, 240, 0xFF14243BU, COLOR_BORDER_BLUE);
+
+            if (has_file && total_cheats == 0) {
+                ui_draw_text(fb, left_x + 50, msg_y + 24,
+                             "< Arquivo encontrado, mas 0 codigos reconhecidos >",
+                             COLOR_TEXT_GOLD, 2);
+
+                char path_line[160];
+                snprintf(path_line, sizeof(path_line), "Arquivo: %s", emulator_get_cheat_file_path(s_osd_player));
+                ui_draw_text_truncated(fb, left_x + 50, msg_y + 64, path_line, COLOR_BORDER_CYAN, 2, left_w - 100);
+
+                const char* st = emulator_get_cheat_status(s_osd_player);
+                if (st && *st) {
+                    ui_draw_text_truncated(fb, left_x + 50, msg_y + 98, st, COLOR_TEXT_MUTED, 2, left_w - 100);
+                }
+
+                ui_draw_text(fb, left_x + 50, msg_y + 138,
+                             "O formato do arquivo pode nao conter codigos compativeis com GBA.",
+                             COLOR_TEXT_LIGHT, 2);
+
+                ui_draw_text(fb, left_x + 50, msg_y + 172,
+                             "Aperte [TRIANGULO] para tentar recarregar novamente.",
+                             COLOR_TEXT_WHITE, 2);
+            } else {
+                ui_draw_text(fb, left_x + 50, msg_y + 24,
+                             "< Nenhum arquivo de cheat (.cht / .cheats) encontrado >",
+                             COLOR_TEXT_GOLD, 2);
+
+                const char* st = emulator_get_cheat_status(s_osd_player);
+                if (st && *st) {
+                    char st_line[160];
+                    snprintf(st_line, sizeof(st_line), "Diagnostico: %s", st);
+                    ui_draw_text_truncated(fb, left_x + 50, msg_y + 60, st_line, COLOR_TEXT_MUTED, 2, left_w - 100);
+                }
+
+                ui_draw_text(fb, left_x + 50, msg_y + 94,
+                             "Coloque o arquivo no Pendrive USB com qualquer uma das opcoes:",
+                             COLOR_TEXT_WHITE, 2);
+
+                ui_draw_text(fb, left_x + 50, msg_y + 128,
+                             "1. Mesmo nome da ROM (<jogo>.cht ou <jogo>.cheats)",
+                             COLOR_TEXT_LIGHT, 2);
+
+                ui_draw_text(fb, left_x + 50, msg_y + 158,
+                             "2. Codigo do jogo (ex: BPRE.cht) na raiz ou pasta cheat/ do USB",
+                             COLOR_TEXT_LIGHT, 2);
+
+                ui_draw_text(fb, left_x + 50, msg_y + 188,
+                             "Aperte [TRIANGULO] a qualquer momento para buscar novamente no USB.",
+                             COLOR_TEXT_GOLD, 2);
+            }
+        } else {
+            char cht_head[160];
+            snprintf(cht_head, sizeof(cht_head), "Origem: %s  |  Jogador P%d (%d codigos)",
+                     emulator_get_cheat_file_path(s_osd_player), s_osd_player + 1, total_cheats);
+            ui_draw_text_truncated(fb, left_x + 30, left_y + 70, cht_head, COLOR_BORDER_CYAN, 2, left_w - 60);
+
+            int start_idx = s_osd_cheat_scroll;
+            int end_idx = start_idx + CHEAT_PAGE_SIZE;
+            if (end_idx > total_cheats) {
+                end_idx = total_cheats;
+            }
+
+            int item_y = left_y + 104;
+            int item_h = 44;
+            int item_gap = 6;
+            int item_w = left_w - 60;
+            int item_x = left_x + 30;
+
+            for (int i = start_idx; i < end_idx; ++i) {
+                bool is_sel = (i == s_osd_cheat_cursor);
+                bool enabled = emulator_is_cheat_enabled(s_osd_player, i);
+                const char* cname = emulator_get_cheat_name(s_osd_player, i);
+
+                uint32_t bg_col = is_sel ? COLOR_ITEM_SEL_BG : COLOR_CARD_BG;
+                uint32_t bdr_col = is_sel ? COLOR_BORDER_CYAN : COLOR_BORDER_INNER;
+                draw_rect_solid(fb, item_x, item_y, item_w, item_h, bg_col);
+                draw_rect_border(fb, item_x, item_y, item_w, item_h, is_sel ? 2 : 1, bdr_col);
+
+                /* Caixas de marcacao em estilo retro [X], [M] ou [ ] */
+                bool is_m = emulator_is_cheat_master(s_osd_player, i);
+                const char* check_tag = enabled ? "[X]" : (is_m ? "[M]" : "[ ]");
+                uint32_t check_col = enabled ? (is_sel ? COLOR_BORDER_CYAN : COLOR_TEXT_GREEN) :
+                                               (is_m ? COLOR_TEXT_GOLD : COLOR_TEXT_MUTED);
+                ui_draw_text(fb, item_x + 16, item_y + (item_h - 16) / 2, check_tag, check_col, 2);
+
+                uint32_t name_col = is_sel ? COLOR_TEXT_WHITE : (enabled ? COLOR_TEXT_LIGHT : (is_m ? COLOR_TEXT_GOLD : COLOR_TEXT_MUTED));
+                ui_draw_text_truncated(fb, item_x + 68, item_y + (item_h - 16) / 2,
+                                       cname ? cname : "Trapaca Sem Nome",
+                                       name_col, 2, item_w - 80);
+
+                item_y += item_h + item_gap;
+            }
+
+            if (total_cheats > CHEAT_PAGE_SIZE) {
+                char pag_info[64];
+                snprintf(pag_info, sizeof(pag_info), "Codigo %d de %d  [L2 / R2: Pagina]",
+                         s_osd_cheat_cursor + 1, total_cheats);
+                ui_draw_text(fb, left_x + 30, left_y + left_h - 36, pag_info, COLOR_TEXT_GOLD, 2);
+            }
+        }
+
+        if (side_w > 120) {
+            draw_box_rpg(fb, side_x, left_y, side_w, left_h, COLOR_BG, COLOR_BORDER_BLUE);
+            ui_draw_text_truncated(fb, side_x + 24, left_y + 24, "DETALHES DO CHEAT", COLOR_TEXT_GOLD, 2, side_w - 48);
+            draw_rect_solid(fb, side_x + 20, left_y + 56, side_w - 40, 1, COLOR_BORDER_INNER);
+
+            int ty = left_y + 80;
+            ui_draw_text(fb, side_x + 24, ty, "JOGADOR ATIVO:", COLOR_BORDER_CYAN, 2); ty += 28;
+            char p_tag[64];
+            snprintf(p_tag, sizeof(p_tag), "Controle P%d (Instancia %d)", s_osd_player + 1, s_osd_player);
+            ui_draw_text(fb, side_x + 24, ty, p_tag, COLOR_TEXT_WHITE, 2); ty += 40;
+
+            ui_draw_text(fb, side_x + 24, ty, "ARQUIVO DE TRAPACA:", COLOR_BORDER_CYAN, 2); ty += 28;
+            const char* cht_f = emulator_get_cheat_file_path(s_osd_player);
+            if (cht_f && *cht_f) {
+                ui_draw_text_wrapped(fb, side_x + 24, ty, cht_f, COLOR_TEXT_USB, 2, side_w - 48, 22);
+                ty += 50;
+            } else {
+                ui_draw_text(fb, side_x + 24, ty, "<Nenhum arquivo>", COLOR_TEXT_MUTED, 2);
+                ty += 40;
+            }
+
+            const char* st_msg = emulator_get_cheat_status(s_osd_player);
+            if (st_msg && *st_msg) {
+                ui_draw_text(fb, side_x + 24, ty, "STATUS DA BUSCA / LEITURA:", COLOR_BORDER_CYAN, 2); ty += 26;
+                ui_draw_text_wrapped(fb, side_x + 24, ty, st_msg, COLOR_TEXT_MUTED, 2, side_w - 48, 20);
+                ty += 44;
+            }
+
+            int total_c = emulator_get_cheat_count(s_osd_player);
+            if (total_c > 0 && s_osd_cheat_cursor >= 0 && s_osd_cheat_cursor < total_c) {
+                ui_draw_text(fb, side_x + 24, ty, "CODIGO SELECIONADO:", COLOR_BORDER_CYAN, 2); ty += 28;
+                const char* cur_name = emulator_get_cheat_name(s_osd_player, s_osd_cheat_cursor);
+                ui_draw_text_wrapped(fb, side_x + 24, ty, cur_name, COLOR_TEXT_WHITE, 2, side_w - 48, 22);
+                ty += 46;
+
+                bool en = emulator_is_cheat_enabled(s_osd_player, s_osd_cheat_cursor);
+                int n_codes = emulator_get_cheat_code_count(s_osd_player, s_osd_cheat_cursor);
+                bool is_m = emulator_is_cheat_master(s_osd_player, s_osd_cheat_cursor);
+
+                ui_draw_text(fb, side_x + 24, ty, "STATUS DA TRAPACA:", COLOR_BORDER_CYAN, 2); ty += 26;
+                ui_draw_text(fb, side_x + 24, ty, en ? "[X] ATIVADO" : "[ ] DESATIVADO",
+                             en ? COLOR_TEXT_GREEN : COLOR_TEXT_MUTED, 2); ty += 36;
+
+                ui_draw_text(fb, side_x + 24, ty, "CODIGOS COMPILADOS:", COLOR_BORDER_CYAN, 2); ty += 26;
+                char c_info[80];
+                snprintf(c_info, sizeof(c_info), "%d opcode(s) em memoria%s",
+                         n_codes, is_m ? " [Master/Hook]" : "");
+                ui_draw_text(fb, side_x + 24, ty, c_info,
+                             n_codes > 0 ? COLOR_TEXT_WHITE : COLOR_TEXT_GOLD, 2); ty += 32;
+
+                if (is_m) {
+                    ui_draw_text_wrapped(fb, side_x + 24, ty,
+                        "* Codigo Mestre (M): auto-ativado quando qualquer cheat e ligado.",
+                        COLOR_TEXT_GOLD, 2, side_w - 48, 20);
+                    ty += 44;
+                }
+            }
+
+            ui_draw_text(fb, side_x + 24, ty, "COMO FUNCIONA:", COLOR_BORDER_CYAN, 2); ty += 30;
+            ui_draw_text_wrapped(fb, side_x + 24, ty,
+                "Os cheats sao interpretados pela libmgba nativa (GameShark, Action Replay, CodeBreaker). A ativacao modifica a memoria do jogo em tempo real sem travar.",
+                COLOR_TEXT_LIGHT, 2, side_w - 48, 22);
+        }
+    }
 
     if (s_osd_tab == OSD_TAB_SAVES) {
         draw_box_rpg(fb, left_x, left_y, left_w, left_h, COLOR_BG, COLOR_BORDER_BLUE);
@@ -2599,6 +2884,10 @@ void ui_menu_render_osd(uint32_t* fb, struct PS4GBA_Context* ctx) {
     if (s_osd_tab == OSD_TAB_CONTROLS) {
         ui_draw_text_truncated(fb, box_x + 40, box_y + box_h - 40,
                                "[D-PAD] Navegar   [O / OPTIONS] Voltar ao Jogo   [TOUCHPAD] Alternar Visualizacao (DualShock 4 / Game Boy Advance)",
+                               COLOR_TEXT_MUTED, 2, box_w - 80);
+    } else if (s_osd_tab == OSD_TAB_CHEATS) {
+        ui_draw_text_truncated(fb, box_x + 40, box_y + box_h - 40,
+                               "[D-PAD] Navegar   [X] Ativar/Desativar Trapaca   [L2 / R2] Pagina   [TRIANGULO] Buscar .cht Novamente   [O / OPTIONS] Voltar",
                                COLOR_TEXT_MUTED, 2, box_w - 80);
     } else {
         ui_draw_text_truncated(fb, box_x + 40, box_y + box_h - 40,

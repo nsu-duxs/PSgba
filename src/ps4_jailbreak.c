@@ -5,10 +5,6 @@
 static bool s_jailbroken = false;
 
 bool ps4_jailbreak_system(void) {
-    if (s_jailbroken) {
-        return true;
-    }
-
     jbc_cred cred;
     if (jbc_get_cred(&cred) == 0) {
         if (jbc_jailbreak_cred(&cred) == 0) {
